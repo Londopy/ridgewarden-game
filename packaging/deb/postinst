@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! id ridgewarden-game >/dev/null 2>&1; then
+        adduser --system --group --home /var/lib/ridgewarden-game --no-create-home ridgewarden-game
+    fi
+    adduser ridgewarden-game ridgewarden >/dev/null
+    install -d -m 750 -o ridgewarden-game -g ridgewarden-game /var/lib/ridgewarden-game
+    # an upgrade from when apps ran as the core's user leaves files it owned
+    chown -R ridgewarden-game:ridgewarden-game /var/lib/ridgewarden-game
+    if [ ! -f /etc/ridgewarden/game.toml ]; then
+        /usr/bin/ridgewarden-game --config /etc/ridgewarden/game.toml init
+    fi
+    # its webhook URLs and passphrases are for this app only, not the other apps
+    # in the ridgewarden group
+    chown root:ridgewarden-game /etc/ridgewarden/game.toml
+    chmod 640 /etc/ridgewarden/game.toml
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        # start once the core is set up; until then there's nothing to follow
+        if [ -f /etc/ridgewarden/ridgewarden.toml ]; then
+            systemctl enable ridgewarden-game >/dev/null 2>&1 || true
+            systemctl restart ridgewarden-game || true
+        fi
+    fi
+fi

@@ -1,0 +1,22 @@
+[Unit]
+Description=ridgewarden-game, a radio-topology game for AREDN meshes
+Documentation=https://github.com/Londopy/ridgewarden-game
+After=network-online.target ridgewarden.service
+Wants=network-online.target
+
+[Service]
+# its own user, in the core's group: it can read the core's local.token, not its station key
+User=ridgewarden-game
+Group=ridgewarden-game
+SupplementaryGroups=ridgewarden
+ExecStart=/usr/bin/ridgewarden-game --config /etc/ridgewarden/game.toml run
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/ridgewarden-game
+
+[Install]
+WantedBy=multi-user.target
