@@ -1,12 +1,10 @@
 # Changelog
 
-All notable changes to ridgewarden-game are listed here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html). The section for a version is
-what appears on its GitHub release page. Validated in CI by
-[patchnotes](https://github.com/Londopy/patchnotes).
+All notable changes to ridgewarden-game are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The section for a version is what appears on its GitHub release page. Validated in CI by [patchnotes](https://github.com/Londopy/patchnotes).
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-11-20
 
 ### Added
 
@@ -28,4 +26,5 @@ what appears on its GitHub release page. Validated in CI by
 - `safe_sites` in the config; `start` refuses sites that aren't on it.
 - A roster closes the game: once an admin puts anyone on it, only rostered callsigns can play.
 
-[Unreleased]: https://github.com/Londopy/ridgewarden-game/commits/main
+[Unreleased]: https://github.com/Londopy/ridgewarden-game/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Londopy/ridgewarden-game/releases/tag/v0.1.0
