@@ -48,6 +48,12 @@ jobs:
         working-directory: ridgewarden-game
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # some tests run the page's signing script, src/player.js, under Node and check what
+      # it signs against the server's own checks (tests/sign.mjs)
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
       - name: Run tests
         working-directory: ridgewarden-game
         run: cargo test --workspace

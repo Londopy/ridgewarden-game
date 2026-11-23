@@ -1,33 +1,41 @@
 //! Game events and what they say: seasons and sessions started and ended by admins, team
-//! lists, check-ins countersigned by the site they were made at, code words claimed for
-//! public sites and foxes, the words revealed after each slot, bearings and spots. Events
+//! lists and player keys set by admins, and the players' own posts: check-ins
+//! countersigned by the site they were made at, code words for public sites, fox codes,
+//! bearings and spots, each signed by the player's key as well as by a site's core. Events
 //! are stored as they came; who may do what is decided when reading, so a change to the
 //! admin list needs no rebuild.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
+use ed25519_dalek::{Signature, VerifyingKey};
 use ridgewarden_client::Event;
 use ridgewarden_client::core::Projection;
-use ridgewarden_client::event::valid_call;
-use ridgewarden_client::mesh::{f, s};
-use ridgewarden_client::util::{norm_node, valid_node};
+use ridgewarden_client::event::{canonical_string, valid_call};
+use ridgewarden_client::mesh::s;
+use ridgewarden_client::util::{norm_node, now_ms, valid_node};
 use rusqlite::{Connection, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::world::Pos;
+use crate::world::{Pos, World};
 
 pub const MIN: i64 = 60_000;
 pub const DAY: i64 = 86_400_000;
 pub const NAME_MAX: usize = 80;
 pub const TEAM_MAX: usize = 24;
-pub const TEAMS_MAX: usize = 8;
+pub const TEAMS_MAX: usize = 4;
 pub const SITES_MAX: usize = 100;
 pub const FOXES_MAX: usize = 20;
+/// one-time codes per fox, and in a whole game; each is 27 bytes of the start event
+pub const CODES_MAX: usize = 100;
+const GAME_CODES_MAX: usize = 500;
 pub const ROSTER_MAX: usize = 500;
 /// longest spot text
 pub const TEXT_MAX: usize = 140;
+/// longest bearing, and latitude or longitude, as typed; the page writes at most 5 and 10
+pub const DEG_MAX: usize = 8;
+pub const POS_MAX: usize = 12;
 /// longest planned session, a week
 pub const MINUTES_MAX: i64 = 7 * 24 * 60;
 /// bigger payloads are ignored; a full roster fits easily
@@ -40,6 +48,8 @@ const PAYLOAD_MAX: usize = 32 * 1024;
 pub struct Rules {
     /// per minute, for each site in a chain of two or more
     pub chain_points: i64,
+    /// a held site goes back to nobody once every link at it has been down this long
+    pub hold_min: i64,
     /// for taking a site from another team or from nobody
     pub capture_points: i64,
     /// each repeat capture of the same site by the same team is worth this much of the last
@@ -71,6 +81,7 @@ impl Default for Rules {
     fn default() -> Self {
         Self {
             chain_points: 1,
+            hold_min: 30,
             capture_points: 10,
             repeat_factor: 0.5,
             encounter_points: 5,
@@ -106,6 +117,7 @@ impl Rules {
         ] {
             within(name, p, 0, 1000)?;
         }
+        within("hold_min", self.hold_min, 5, 1440)?;
         within("repeat_factor", self.repeat_factor, 0.0, 1.0)?;
         within("encounter_min", self.encounter_min, 0, 120)?;
         within("builder_days", self.builder_days, 1, 365)?;
@@ -163,7 +175,7 @@ fn check_names(what: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// A team list: 2 to 8 valid names, no two the same ignoring case.
+/// A team list: 2 to 4 valid names, no two the same ignoring case.
 pub fn check_teams(teams: &[String]) -> Result<()> {
     if !(2..=TEAMS_MAX).contains(&teams.len()) {
         bail!("a game needs 2 to {TEAMS_MAX} teams");
@@ -171,7 +183,7 @@ pub fn check_teams(teams: &[String]) -> Result<()> {
     check_names("team", teams)
 }
 
-/// A hidden transmitter that sends rotating code words.
+/// A hidden transmitter. Whoever finds it takes one of the one-time codes left with it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Fox {
     pub name: String,
@@ -179,6 +191,9 @@ pub struct Fox {
     pub call: Option<String>,
     /// where it was, once an admin says at the end
     pub at: Option<Pos>,
+    /// hashes of its one-time codes (`words::code_hash`), so any site can check a code
+    #[serde(default)]
+    pub codes: Vec<String>,
 }
 
 /// Where a play happened: a site (by LAN check-in or code word) or a fox.
@@ -229,6 +244,9 @@ pub struct Session {
     /// public sites, taken with the code word heard on air there
     pub word_sites: Vec<String>,
     pub foxes: Vec<Fox>,
+    /// mixed into the fox codes and their hashes, so no two games share a code
+    #[serde(default)]
+    pub nonce: String,
     /// the season it counts towards
     pub season: Option<String>,
     pub rules: Rules,
@@ -239,11 +257,12 @@ impl Session {
         self.start <= now && now < self.end
     }
 
-    /// Everything that sends code words.
+    /// The public sites, which send rotating code words.
     pub fn word_targets(&self) -> Vec<Target> {
-        let sites = self.word_sites.iter().map(|n| Target::Site(n.clone()));
-        let foxes = self.foxes.iter().map(|f| Target::Fox(f.name.clone()));
-        sites.chain(foxes).collect()
+        self.word_sites
+            .iter()
+            .map(|n| Target::Site(n.clone()))
+            .collect()
     }
 
     pub fn fox(&self, name: &str) -> Option<&Fox> {
@@ -263,11 +282,11 @@ impl Session {
 pub enum How {
     /// on the node's LAN, signed by this core
     Lan { key: String },
-    /// with a code word heard on air
+    /// with a code word heard on air, or a fox's one-time code
     Word { word: String },
 }
 
-/// A check-in or a code word claim.
+/// A check-in, a code word claim or a fox code.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Play {
     pub id: String,
@@ -276,6 +295,8 @@ pub struct Play {
     pub team: String,
     pub target: Target,
     pub how: How,
+    /// the player key that signed it, if the signature checked out
+    pub key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -316,13 +337,24 @@ CREATE TABLE IF NOT EXISTS game_events (
     call     TEXT NOT NULL,
     payload  TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS game_events_kind ON game_events(kind, ts);";
+CREATE INDEX IF NOT EXISTS game_events_kind ON game_events(kind, ts);
+CREATE TABLE IF NOT EXISTS signers (
+    event_id TEXT PRIMARY KEY,
+    key      TEXT NOT NULL,
+    call     TEXT NOT NULL,
+    session  TEXT NOT NULL,
+    site     TEXT
+);";
 
-const KINDS: [&str; 9] = [
+/// What players post. Each carries the player's key (`pk`) and signature (`psig`).
+pub const PLAYER_KINDS: [&str; 4] = ["game.checkin", "game.word", "game.bearing", "game.spot"];
+
+const KINDS: [&str; 10] = [
     "game.season",
     "game.start",
     "game.teams",
     "game.end",
+    "game.key",
     "game.checkin",
     "game.word",
     "game.reveal",
@@ -336,7 +368,7 @@ impl Projection for Game {
     }
 
     fn reset(&self, tx: &Transaction) -> Result<()> {
-        tx.execute("DELETE FROM game_events", [])?;
+        tx.execute_batch("DELETE FROM game_events; DELETE FROM signers;")?;
         Ok(())
     }
 
@@ -361,8 +393,67 @@ impl Projection for Game {
                 payload
             ],
         )?;
+        // checked once here rather than on every scoring
+        if PLAYER_KINDS.contains(&e.kind.as_str())
+            && let Some(key) = signer(&e.kind, &e.payload)
+        {
+            let p = &e.payload;
+            tx.execute(
+                "INSERT OR IGNORE INTO signers (event_id, key, call, session, site)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    e.id,
+                    key,
+                    s(p, "call").unwrap_or_default(),
+                    s(p, "session").unwrap_or_default(),
+                    s(p, "site")
+                ],
+            )?;
+        }
         Ok(())
     }
+}
+
+/// The text a player signs for a post: its payload without `psig`, plus the event kind,
+/// as canonical JSON. The page's script builds the same text. A payload with a `kind` of
+/// its own has none, since the event's kind would take its place unsigned.
+pub fn signed_text(kind: &str, payload: &Value) -> Option<String> {
+    let mut m = payload.as_object()?.clone();
+    if m.contains_key("kind") {
+        return None;
+    }
+    m.remove("psig");
+    m.insert("kind".into(), kind.into());
+    Some(canonical_string(&Value::Object(m)))
+}
+
+/// A player key as the pages show it: 64 lower-case hex digits of a usable Ed25519 key.
+pub fn valid_key(k: &str) -> bool {
+    hex::decode(k).ok().is_some_and(|b| {
+        hex::encode(&b) == k
+            && <[u8; 32]>::try_from(b).is_ok_and(|b| VerifyingKey::from_bytes(&b).is_ok())
+    })
+}
+
+/// The player key that signed a post, if its `pk` and `psig` check out.
+pub fn signer(kind: &str, payload: &Value) -> Option<String> {
+    let pk = s(payload, "pk").filter(|k| valid_key(k))?;
+    let key: [u8; 32] = hex::decode(pk).ok()?.try_into().ok()?;
+    let psig = s(payload, "psig")?;
+    let sig: [u8; 64] = hex::decode(psig).ok()?.try_into().ok()?;
+    // one spelling per signature, or a replay in capitals would pass as a new post
+    if hex::encode(sig) != psig {
+        return None;
+    }
+    // verify_strict refuses the weak keys that would "verify" anything
+    VerifyingKey::from_bytes(&key)
+        .ok()?
+        .verify_strict(
+            signed_text(kind, payload)?.as_bytes(),
+            &Signature::from_bytes(&sig),
+        )
+        .ok()?;
+    Some(pk.to_string())
 }
 
 struct Row {
@@ -373,19 +464,31 @@ struct Row {
     key: String,
     call: String,
     payload: Value,
+    /// for a player's post, the player key whose signature checked out
+    signer: Option<String>,
 }
 
 impl Row {
     fn about(&self, session: &str) -> bool {
         s(&self.payload, "session") == Some(session)
     }
+
+    /// Whether a player's post counts for `call`: signed by the key it plays with, or by
+    /// any player key while it has none.
+    fn by(&self, call: &str, keys: &Keys) -> bool {
+        match keys.get(call) {
+            Some(k) => self.signer.as_ref() == Some(k),
+            None => self.signer.is_some(),
+        }
+    }
 }
 
 /// Events of the given kinds, oldest first.
 fn rows(conn: &Connection, kinds: &[&str]) -> Result<Vec<Row>> {
     let mut st = conn.prepare(
-        "SELECT event_id, kind, ts, lamport, key, call, payload FROM game_events
-         WHERE kind = ?1 ORDER BY ts, lamport, event_id",
+        "SELECT e.event_id, e.kind, e.ts, e.lamport, e.key, e.call, e.payload, s.key
+         FROM game_events e LEFT JOIN signers s ON s.event_id = e.event_id
+         WHERE e.kind = ?1 ORDER BY e.ts, e.lamport, e.event_id",
     )?;
     let mut out = vec![];
     for kind in kinds {
@@ -398,12 +501,92 @@ fn rows(conn: &Connection, kinds: &[&str]) -> Result<Vec<Row>> {
                 key: r.get(4)?,
                 call: r.get(5)?,
                 payload: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(Value::Null),
+                signer: r.get(7)?,
             })
         })? {
             out.push(r?);
         }
     }
     out.sort_by(|a, b| (a.ts, a.lamport, &a.id).cmp(&(b.ts, b.lamport, &b.id)));
+    Ok(out)
+}
+
+/// Players' posts of the given kinds, oldest first. A signed post that shows up again with
+/// the same signature, sent on by someone who saw it, is left out, and so is a copy whose
+/// signature was respelled so it no longer checks out, whichever came first.
+fn posts(conn: &Connection, kinds: &[&str]) -> Result<Vec<Row>> {
+    let rows = rows(conn, kinds)?;
+    let good: BTreeSet<String> = rows
+        .iter()
+        .filter(|r| r.signer.is_some())
+        .filter_map(|r| s(&r.payload, "psig"))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut seen = BTreeSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|r| match (&r.signer, s(&r.payload, "psig")) {
+            (Some(_), Some(sig)) => seen.insert(sig.to_string()),
+            (None, Some(sig)) => !good.contains(&sig.to_ascii_lowercase()),
+            _ => true,
+        })
+        .collect())
+}
+
+/// Callsign -> the player key it plays with.
+pub type Keys = BTreeMap<String, String>;
+
+/// Each callsign's player key: the key of its first post that a game's rules would accept
+/// on their own, unless an admin set another with `player-key`, in which case the latest
+/// one an admin set. In a game with a roster that is any post by a rostered callsign;
+/// otherwise only a check-in countersigned by the core that polls that site over its LAN,
+/// so nobody can take a callsign from afar. First is by lamport, not by any core's clock.
+pub fn keys(conn: &Connection, admins: &[String]) -> Result<Keys> {
+    let games: BTreeMap<String, Session> = sessions(conn, admins, now_ms())?
+        .into_iter()
+        .map(|g| (g.id.clone(), g))
+        .collect();
+    let lan = World::places(conn)?.lan_keys;
+    let mut st = conn.prepare(
+        "SELECT e.kind, e.key, s.key, s.call, s.session, s.site
+         FROM signers s JOIN game_events e ON e.event_id = s.event_id
+         ORDER BY e.lamport, e.event_id",
+    )?;
+    let mut signed = st.query([])?;
+    let mut out = Keys::new();
+    while let Some(r) = signed.next()? {
+        let (kind, core, key, call, session): (String, String, String, String, String) =
+            (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+        let site: Option<String> = r.get(5)?;
+        let Some(g) = games.get(&session) else {
+            continue;
+        };
+        let accepted = if g.roster.is_empty() {
+            kind == "game.checkin"
+                && site.is_some_and(|n| {
+                    g.sites.contains(&n) && lan.get(&n).is_some_and(|k| k.contains(&core))
+                })
+        } else {
+            g.roster.contains_key(&call)
+        };
+        if accepted && valid_call(&call) {
+            out.entry(call).or_insert(key);
+        }
+    }
+    let mut set: Vec<Row> = rows(conn, &["game.key"])?
+        .into_iter()
+        .filter(|r| admins.contains(&r.key))
+        .collect();
+    // by lamport, like team lists, so every site picks the same one
+    set.sort_by(|a, b| (a.lamport, &a.id).cmp(&(b.lamport, &b.id)));
+    for r in set {
+        if let (Some(call), Some(key)) = (s(&r.payload, "call"), s(&r.payload, "key"))
+            && valid_call(call)
+            && valid_key(key)
+        {
+            out.insert(call.to_string(), key.to_string());
+        }
+    }
     Ok(out)
 }
 
@@ -470,14 +653,28 @@ fn parse_foxes(p: &Value) -> Result<Vec<Fox>> {
                 call.unwrap_or_default()
             );
         }
+        let codes = match f.get("codes") {
+            None | Some(Value::Null) => vec![],
+            Some(c) => str_list(Some(c)).with_context(|| format!("fox {name:?}: bad codes"))?,
+        };
+        let hashes_ok = codes
+            .iter()
+            .all(|h| h.len() == 24 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        if !hashes_ok || codes.len() > CODES_MAX {
+            bail!("fox {name:?}: codes must be up to {CODES_MAX} code hashes");
+        }
         out.push(Fox {
             name,
             call,
             at: None,
+            codes,
         });
     }
     let names: Vec<String> = out.iter().map(|f| f.name.clone()).collect();
     check_names("fox", &names)?;
+    if out.iter().map(|f| f.codes.len()).sum::<usize>() > GAME_CODES_MAX {
+        bail!("at most {GAME_CODES_MAX} fox codes in one game");
+    }
     Ok(out)
 }
 
@@ -488,6 +685,7 @@ pub struct Start {
     pub sites: Vec<String>,
     pub word_sites: Vec<String>,
     pub foxes: Vec<Fox>,
+    pub nonce: String,
     pub season: Option<String>,
     pub rules: Rules,
     pub minutes: i64,
@@ -507,6 +705,10 @@ impl Start {
         let foxes = parse_foxes(p)?;
         if sites.is_empty() && word_sites.is_empty() && foxes.is_empty() {
             bail!("a game needs at least one check-in site, public site or fox");
+        }
+        let nonce = s(p, "nonce").unwrap_or("");
+        if nonce.len() > 64 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("nonce must be up to 64 hex digits");
         }
         if sites.len() + word_sites.len() > SITES_MAX {
             bail!("at most {SITES_MAX} sites");
@@ -530,6 +732,7 @@ impl Start {
             sites,
             word_sites,
             foxes,
+            nonce: nonce.to_string(),
             season: s(p, "season").map(str::to_string),
             rules,
             minutes,
@@ -552,6 +755,7 @@ fn parse_start(r: &Row) -> Option<Session> {
         sites: st.sites,
         word_sites: st.word_sites,
         foxes: st.foxes,
+        nonce: st.nonce,
         season: st.season,
         rules: st.rules,
     })
@@ -667,10 +871,10 @@ fn player(p: &Value) -> Option<(String, String)> {
     (valid_call(call) && team.len() <= TEAM_MAX).then(|| (call.to_string(), team.to_string()))
 }
 
-/// Check-ins and code word claims for one session, oldest first. Whether each counts is
-/// the scorer's job.
+/// Check-ins, code word claims and fox codes for one session, oldest first. Whether each
+/// counts is the scorer's job.
 pub fn plays(conn: &Connection, session: &str) -> Result<Vec<Play>> {
-    Ok(rows(conn, &["game.checkin", "game.word"])?
+    Ok(posts(conn, &["game.checkin", "game.word"])?
         .into_iter()
         .filter(|r| r.about(session))
         .filter_map(|r| {
@@ -693,6 +897,7 @@ pub fn plays(conn: &Connection, session: &str) -> Result<Vec<Play>> {
                 team,
                 target,
                 how,
+                key: r.signer,
             })
         })
         .collect())
@@ -720,17 +925,27 @@ pub fn reveals(conn: &Connection, s_: &Session) -> Result<BTreeMap<(String, i64)
     Ok(out)
 }
 
-/// Bearings taken on a session's foxes, oldest first.
-pub fn bearings(conn: &Connection, s_: &Session) -> Result<Vec<Bearing>> {
-    Ok(rows(conn, &["game.bearing"])?
+/// A number a player's post carries as text, as signed, if the text is at most `max` long.
+pub fn num(p: &Value, key: &str, max: usize) -> Option<f64> {
+    s(p, key)
+        .filter(|v| v.len() <= max)?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|x: &f64| x.is_finite())
+}
+
+/// Bearings taken on a session's foxes, signed by the players' own keys, oldest first.
+pub fn bearings(conn: &Connection, s_: &Session, keys: &Keys) -> Result<Vec<Bearing>> {
+    Ok(posts(conn, &["game.bearing"])?
         .into_iter()
         .filter(|r| r.about(&s_.id))
         .filter_map(|r| {
             let p = &r.payload;
-            let call = s(p, "call").filter(|c| valid_call(c))?;
+            let call = s(p, "call").filter(|c| valid_call(c) && r.by(c, keys))?;
             let fox = s(p, "fox").filter(|f| s_.fox(f).is_some())?;
-            let deg = f(p, "deg").filter(|d| (0.0..360.0).contains(d))?;
-            let from = Pos::new(f(p, "lat")?, f(p, "lon")?)?;
+            let deg = num(p, "deg", DEG_MAX).filter(|d| (0.0..360.0).contains(d))?;
+            let from = Pos::new(num(p, "lat", POS_MAX)?, num(p, "lon", POS_MAX)?)?;
             Some(Bearing {
                 ts: r.ts,
                 call: call.to_string(),
@@ -742,13 +957,13 @@ pub fn bearings(conn: &Connection, s_: &Session) -> Result<Vec<Bearing>> {
         .collect())
 }
 
-/// Spots posted during a session, oldest first.
-pub fn spots(conn: &Connection, session: &str) -> Result<Vec<Spot>> {
-    Ok(rows(conn, &["game.spot"])?
+/// Spots posted during a session, signed by the players' own keys, oldest first.
+pub fn spots(conn: &Connection, session: &str, keys: &Keys) -> Result<Vec<Spot>> {
+    Ok(posts(conn, &["game.spot"])?
         .into_iter()
         .filter(|r| r.about(session))
         .filter_map(|r| {
-            let call = s(&r.payload, "call").filter(|c| valid_call(c))?;
+            let call = s(&r.payload, "call").filter(|c| valid_call(c) && r.by(c, keys))?;
             let text: String = s(&r.payload, "text")?
                 .trim()
                 .chars()
@@ -807,11 +1022,41 @@ mod tests {
         assert_eq!(st.minutes, MINUTES_MAX, "no planned end means a week");
         let none = json!({"name": "Empty", "teams": ["Red", "Blue"]});
         assert!(Start::parse(&none).is_err());
+        let four =
+            json!({"name": "Four", "teams": ["Red", "Blue", "Green", "Gold"], "sites": ["a"]});
+        assert!(Start::parse(&four).is_ok());
+        let five = json!({"name": "Five", "teams": ["Red", "Blue", "Green", "Gold", "Gray"],
+            "sites": ["a"]});
+        assert!(Start::parse(&five).is_err());
         let dup = json!({"name": "Dup", "teams": ["Red", "Blue"],
             "foxes": [{"name": "Fox"}, {"name": "fox"}]});
         assert!(Start::parse(&dup).is_err());
         let bad_window = json!({"name": "W", "teams": ["Red", "Blue"], "sites": ["a"],
             "rules": {"builder_days": 5, "builder_window_days": 4}});
         assert!(Start::parse(&bad_window).is_err());
+    }
+
+    #[test]
+    fn a_signature_checks_out_only_as_it_was_made() {
+        use crate::testing::{pk, player_key, signed};
+        let key = player_key("N0AAA");
+        let p = json!({"session": "s1", "call": "N0AAA", "text": "hi", "t": 1});
+        let p = signed("game.spot", p, &key);
+        assert_eq!(signer("game.spot", &p), Some(pk(&key)));
+        assert_eq!(signer("game.word", &p), None, "under another kind");
+        let mut shouted = p.clone();
+        shouted["psig"] = json!(p["psig"].as_str().unwrap().to_uppercase());
+        assert_eq!(
+            signer("game.spot", &shouted),
+            None,
+            "the same signature in capitals"
+        );
+        let mut with_kind = p.clone();
+        with_kind["kind"] = json!("game.spot");
+        assert_eq!(
+            signer("game.spot", &with_kind),
+            None,
+            "a payload with its own kind"
+        );
     }
 }

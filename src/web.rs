@@ -37,6 +37,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/word", get(forms::word_page).post(forms::word_post))
         .route("/hunt", get(forms::hunt_page).post(forms::hunt_post))
         .route("/spot", get(forms::spot_page).post(forms::spot_post))
+        .route("/player.js", get(forms::player_js))
+        .route("/key", get(forms::key_of))
         .route("/rules", get(rules_page))
         .route("/games", get(history::games_page))
         .route("/seasons", get(history::seasons_page))
@@ -113,7 +115,8 @@ pub const STYLE: &str = "<style>
 .sw{display:inline-block;width:.8em;height:.8em;border-radius:2px;margin-right:.35em;vertical-align:-.05em}
 td.n,th.n{text-align:right}
 form.checkin label{display:block;margin:10px 0}form.checkin input,form.checkin select{font:inherit;padding:6px 8px;min-width:12em}
-form.checkin button{font:inherit;padding:8px 16px;margin-top:6px}
+form.checkin button{font:inherit;padding:8px 16px;margin-top:6px}form.checkin [hidden]{display:none}
+.banner,code{overflow-wrap:anywhere}
 </style>";
 
 /// Swaps in a fresh copy of the page every 15 s; without it the page still reloads
@@ -485,6 +488,9 @@ fn sites_table(app: &App, p: &Played, colors: &BTreeMap<String, &str>) -> String
             None if p.dead_sites.contains(&n) => {
                 "<span class=mute>nobody; no core polls this node over its LAN</span>".into()
             }
+            None if p.lost.iter().any(|l| l.site == n) => {
+                "<span class=mute>nobody; lost when its links stayed down</span>".into()
+            }
             None => "<span class=mute>nobody yet</span>".into(),
         };
         let _ = write!(
@@ -613,6 +619,28 @@ pub fn spots_list(p: &Played) -> String {
     b
 }
 
+/// Sites that went back to nobody because every link at them stayed down.
+fn lost_html(app: &App, p: &Played) -> String {
+    if p.lost.is_empty() {
+        return String::new();
+    }
+    let mut b = format!(
+        "<p>Sites lost after {} minutes with every link down:</p><ul class=plain>",
+        p.session.rules.hold_min
+    );
+    for l in &p.lost {
+        let _ = write!(
+            b,
+            "<li><span class=\"mute small\">{}</span> {}, lost by {}</li>",
+            esc(&short_time(l.ts)[11..]),
+            esc(&app.cfg.label(&l.site)),
+            esc(&l.team)
+        );
+    }
+    b.push_str("</ul>");
+    b
+}
+
 /// What the network did during the game, for the debrief: every link that dropped, for
 /// how long, and whose chains it broke.
 fn debrief(app: &App, p: &Played) -> String {
@@ -712,6 +740,7 @@ async fn game_page(
     b.push_str(&spots_list(&p));
     b.push_str("<h2>What the network did</h2>");
     b.push_str(&debrief(&app, &p));
+    b.push_str(&lost_html(&app, &p));
     let _ = write!(
         b,
         "<p class=\"mute small\">Worked out at {} from the signed game log and the mesh's own \
@@ -737,11 +766,17 @@ pub fn rules_html(r: &Rules) -> String {
     let types = r.link_types.join(", ");
     format!(
         "<ol>\
+<li><b>Players.</b> Every post crosses the mesh's radio links, so players are licensed \
+operators, each under their own callsign. Spectators only watch. Each player has their own \
+key, made in the browser from their callsign and a passphrase that never leaves the page, \
+and signs every check-in, code word, bearing and spot with it. A callsign's first check-in on \
+a site's LAN sets its key for every game after (in a game with a roster, its first post does), \
+unless an admin sets another; until then any player key can post under it.</li>\
 <li><b>Check in.</b> Go to a check-in site and open its game page on a phone or laptop \
-connected to that node's own LAN. Enter your callsign and team. The site's core signs the \
-check-in, so it can't be made from anywhere else. You stay on the team of your first \
-check-in for the whole game, unless an admin put you on a team. Once anyone is on the \
-roster, only rostered callsigns can play.</li>\
+connected to that node's own LAN. Enter your callsign, passphrase and team. The site's core \
+countersigns the check-in, so it can't be made from anywhere else. You stay on the team of \
+your first check-in for the whole game, unless an admin put you on a team. Once anyone is on \
+the roster, only rostered callsigns can play.</li>\
 <li><b>Public sites.</b> At a public site you can't reach the node's LAN, so someone there \
 sends a code word on air that changes every {wm} minutes. Type what you heard on the code \
 word page of any site. One try per word; it counts once the word is revealed, a few minutes \
@@ -754,8 +789,11 @@ in at a site your team already holds earns nothing.</li>\
 is two or more of your team's sites joined by {types} links that are up in the mesh's own \
 link data, either directly or through relay nodes that aren't game sites. A site held by \
 nobody or by another team breaks the chain. A lone site earns nothing.</li>\
-<li><b>Decay.</b> When a link drops (two polls in a row without it, or no fresh data for \
-{fresh} min), every chain through it breaks at once and its points stop until it is back. \
+<li><b>Dropped links.</b> When a link drops (two polls in a row without it, or no fresh \
+data for {fresh} min), every chain through it breaks at once and its points stop until it is \
+back.</li>\
+<li><b>Holding a site.</b> A site stays yours only while it has a link up. Once every link \
+at it has been down for {hold} minutes, it goes back to nobody and has to be captured again. \
 Keeping the network healthy is how you win.</li>\
 <li><b>Builder bonus.</b> A new link in a chain earns {bp} extra point(s) a minute. A link \
 is new for {bw} days after it first shows up, if one of its ends was polled on an earlier \
@@ -763,9 +801,11 @@ day without it, and it only earns the bonus once it has shown up in link data on
 different days, so it can't be faked for a day.</li>\
 <li><b>Encounters.</b> When players from two teams check in at the same site within {em} \
 minutes of each other, both get {ep} points. Each callsign can earn this once per site.</li>\
-<li><b>Foxes.</b> A fox is a hidden transmitter sending its own code words. Finding it and \
-sending its word earns {fp} points, once per fox, and whoever runs it gets {ep} for each \
-finder. Bearings shared on the hunt page show on the map for everyone.</li>\
+<li><b>Foxes.</b> A fox is a hidden transmitter with one-time codes left with it. When you \
+find it, take a code and send it on the code word page of any site. Each code counts once, \
+for whoever sends it first, so passing one on gives your find away. Finding a fox earns {fp} \
+points, once per fox, and whoever runs it gets {ep} for each finder. Bearings shared on the \
+hunt page show on the map for everyone.</li>\
 <li><b>Travel time.</b> Two check-ins by one callsign at sites closer in time than their \
 distance allows at {speed} km/h don't count. The first is a warning; after {strikes} the \
 player is out of the game.</li>\
@@ -775,6 +815,7 @@ player is out of the game.</li>\
         f = r.repeat_factor,
         chain = r.chain_points,
         fresh = r.fresh_s / 60,
+        hold = r.hold_min,
         bp = r.builder_points,
         bw = r.builder_window_days,
         bd = r.builder_days,
