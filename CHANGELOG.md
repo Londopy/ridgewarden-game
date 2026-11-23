@@ -4,6 +4,25 @@ All notable changes to ridgewarden-game are listed here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- Each player signs their posts with their own key, made in the browser from their callsign and a passphrase that never leaves the page. A callsign's first check-in on a site's LAN sets its key for every game (in a game with a roster, its first post does); an admin can set another with `player-key`, and the player's page shows it.
+- The page wants a passphrase of 12 characters or more, asks for it twice before a post that would set a callsign's key, and can suggest four random words with two digits each.
+- A held site goes back to nobody once every link at it has been down for `hold_min` minutes (30 by default), and the game page lists the sites lost.
+
+### Changed
+
+- Every site in a game has to run this version: older sites can't read the new start events, and games with 5 to 8 teams no longer load.
+- Fox finds are proven with one-time codes of 16 characters left with the fox (`start --codes`, written to `codes-<id>.csv`) instead of code words sent on air. Each code counts once, for whoever sends it first.
+- A game has 2 to 4 teams, down from up to 8.
+- Once a game has a roster, the sites refuse posts from callsigns not on it.
+- Posting needs JavaScript, since the page signs each post.
+- The words and codes files are readable only by their owner, like the seed they come from.
+
+### Fixed
+
+- The Fox finder award said "found 1 foxes".
+
 ## [0.1.0] - 2026-11-20
 
 ### Added
