@@ -57,8 +57,8 @@ impl Record {
 struct Def {
     name: &'static str,
     tiers: &'static [u64],
-    /// what earning it means, with {} for the tier
-    what: &'static str,
+    /// what earning a tier means
+    what: fn(u64) -> String,
     value: fn(&Record) -> u64,
 }
 
@@ -66,37 +66,40 @@ const AWARDS: &[Def] = &[
     Def {
         name: "Site visitor",
         tiers: &[3, 10, 25],
-        what: "counted at {} different sites",
+        what: |t| format!("counted at {t} different sites"),
         value: |r| r.sites.len() as u64,
     },
     Def {
         name: "Regular",
         tiers: &[3, 10, 25],
-        what: "played {} games",
+        what: |t| format!("played {t} games"),
         value: |r| r.games.len() as u64,
     },
     Def {
         name: "Fox finder",
         tiers: &[1, 5, 20],
-        what: "found {} foxes",
+        what: |t| match t {
+            1 => "found a fox".into(),
+            t => format!("found {t} foxes"),
+        },
         value: |r| r.finds,
     },
     Def {
         name: "Meet and greet",
         tiers: &[5, 25],
-        what: "met players from other teams {} times",
+        what: |t| format!("met players from other teams {t} times"),
         value: |r| r.encounters,
     },
     Def {
         name: "Chain gang",
         tiers: &[3, 5, 8],
-        what: "on a team that held a chain of {} sites",
+        what: |t| format!("on a team that held a chain of {t} sites"),
         value: |r| r.best_chain,
     },
     Def {
         name: "Builder's friend",
         tiers: &[1],
-        what: "on a team that scored on a new link in {} game",
+        what: |t| format!("on a team that scored on a new link in {t} game"),
         value: |r| r.builder_games,
     },
 ];
@@ -119,7 +122,7 @@ pub fn awards(games: &[Arc<Played>]) -> Vec<Award> {
         .flat_map(|d| {
             d.tiers.iter().map(|t| Award {
                 name: format!("{} {t}", d.name),
-                what: d.what.replace("{}", &t.to_string()),
+                what: (d.what)(*t),
                 earned: vec![],
             })
         })
@@ -340,5 +343,13 @@ mod tests {
             2,
             "a-n and a-b both appeared after a was first polled"
         );
+    }
+
+    #[test]
+    fn award_text_reads_right_for_a_tier_of_one() {
+        let text: Vec<(String, String)> =
+            awards(&[]).into_iter().map(|a| (a.name, a.what)).collect();
+        assert!(text.contains(&("Fox finder 1".into(), "found a fox".into())));
+        assert!(text.contains(&("Fox finder 5".into(), "found 5 foxes".into())));
     }
 }

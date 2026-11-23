@@ -1,11 +1,13 @@
 //! ridgewarden-game: Capture the Site on a real AREDN mesh. Teams check in at sites in
 //! person, and score for chains of their sites while the RF links between them are up in
-//! the mesh's own data. Fox hunts, public sites taken with code words heard on air,
-//! seasons and awards are built on the same log.
+//! the mesh's own data; a site whose links stay down goes back to nobody. Fox hunts,
+//! public sites taken with code words heard on air, seasons and awards are built on the
+//! same log.
 //!
 //! Runs next to a ridgewarden core and builds its view from the core's event feed. Admins
-//! start and end games through their own core; check-ins are made on a site's own page
-//! from that node's LAN and countersigned by that site's core.
+//! start and end games through their own core. Players sign every post with their own
+//! key; check-ins are made on a site's own page from that node's LAN and countersigned by
+//! that site's core.
 
 pub mod archive;
 pub mod chains;
@@ -134,7 +136,7 @@ impl App {
         }
         let m = minutes.entry(s.id.clone()).or_default();
         let caught_up = self.caught_up.load(Ordering::Relaxed);
-        let p = Arc::new(played(&db, s, now_ms(), caught_up, m)?);
+        let p = Arc::new(played(&db, s, now_ms(), caught_up, &self.cfg.admins, m)?);
         if caught_up > s.end + SETTLE {
             // frozen now, so its minutes won't be needed again
             minutes.remove(&s.id);
@@ -176,6 +178,7 @@ pub fn played(
     s: &Session,
     now: i64,
     caught_up: i64,
+    admins: &[String],
     minutes: &mut Minutes,
 ) -> Result<Played> {
     let frozen: Option<String> = conn
@@ -198,7 +201,7 @@ pub fn played(
             ),
         }
     }
-    let p = score::play(conn, s, now, minutes)?;
+    let p = score::play(conn, s, now, &game::keys(conn, admins)?, minutes)?;
     if frozen.is_none() && caught_up > s.end + SETTLE {
         conn.execute(
             "INSERT INTO results (session, json) VALUES (?1, ?2)",

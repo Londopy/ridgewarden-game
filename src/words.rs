@@ -1,8 +1,15 @@
-//! Rotating code words for public sites and foxes. The admin's app keeps a secret seed;
-//! each target's word for each slot of `word_min` minutes is derived from it. Someone at
-//! the site, or the fox transmitter, sends the current word on air; a player who hears it
-//! types it in on any site's page. After each slot ends, the admin's app reveals that
-//! slot's words in signed events, and claims made before the reveal count.
+//! Code words for public sites, and one-time codes for foxes. The admin's app keeps a
+//! secret seed and derives both from it.
+//!
+//! A public site's word changes every `word_min` minutes. Someone at the site sends the
+//! current word on air; a player who hears it types it in on any site's page. After each
+//! slot ends, the admin's app reveals that slot's words in signed events, and claims made
+//! before the reveal count.
+//!
+//! A fox can be heard from far off, so hearing it proves nothing. Its codes are left with
+//! it, on a card or with whoever runs it, and each counts once, so passing one on gives
+//! the find away rather than sharing it. The start event carries a hash of each code, so
+//! every site checks them straight away without the seed.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -35,6 +42,12 @@ const WORDS: [&str; 128] = [
     "WALNUT", "WILLOW", "WINDMILL", "WIZARD", "YARROW", "ZEBRA", "ZIPPER",
 ];
 
+/// The words the page picks from when it suggests a passphrase: four of them with two
+/// digits each give about 54 bits.
+pub fn passphrase_words() -> String {
+    WORDS.join(" ").to_lowercase()
+}
+
 pub type Seed = [u8; 32];
 
 /// The word for one target and slot, e.g. "OTTER LANTERN 42".
@@ -58,6 +71,64 @@ pub fn normalize(w: &str) -> String {
         .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_uppercase())
         .collect()
+}
+
+/// Crockford's base32, which leaves out I, L, O and U so a code read off a card in the
+/// dark isn't misread.
+const CODE_CHARS: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Fox `fox`'s nth one-time code, e.g. "K7QM-3XRD-9PTW-4HCA": 16 characters of 5 bits,
+/// 80 bits, so trying codes against the hashes in the start event takes years even on fast
+/// hardware.
+pub fn fox_code(seed: &Seed, nonce: &str, fox: &str, n: usize) -> String {
+    let h = blake3::keyed_hash(seed, format!("fox code|{nonce}|{fox}|{n}").as_bytes());
+    let mut out = String::new();
+    for (i, b) in h.as_bytes()[..16].iter().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push('-');
+        }
+        out.push(CODE_CHARS[(b % 32) as usize] as char);
+    }
+    out
+}
+
+/// A typed fox code as it is hashed: letters and digits, upper case, with the letters
+/// people mistake for digits read as those digits.
+fn code_norm(typed: &str) -> String {
+    normalize(typed)
+        .chars()
+        .map(|c| match c {
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        })
+        .collect()
+}
+
+/// The hash of a fox code that the start event carries, 96 bits as hex.
+pub fn code_hash(nonce: &str, fox: &str, typed: &str) -> String {
+    let text = format!(
+        "ridgewarden-game fox code|{nonce}|{fox}|{}",
+        code_norm(typed)
+    );
+    blake3::hash(text.as_bytes()).to_hex()[..24].to_string()
+}
+
+/// Every fox's codes, one line each: what the admin prints and leaves with the foxes.
+pub fn codes(seed: &Seed, s: &Session) -> String {
+    let mut out = String::from("fox,n,code\n");
+    for f in &s.foxes {
+        for n in 0..f.codes.len() {
+            let _ = writeln!(
+                out,
+                "{},{},{}",
+                f.name,
+                n + 1,
+                fox_code(seed, &s.nonce, &f.name, n)
+            );
+        }
+    }
+    out
 }
 
 /// The slot a moment falls in, counted from the start of the session.
@@ -101,30 +172,33 @@ pub fn seed(path: &Path) -> Result<Seed> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
-    std::fs::write(path, seed).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_private(path, &seed)?;
     Ok(seed)
 }
 
-/// Every word of a session, one line per target and slot: what the admin hands to the
-/// people at public sites and loads into the fox transmitters.
+/// Write a file only its owner can read: the seed, and the words and codes made from it.
+pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, data))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Every word of a session, one line per public site and slot: what the admin hands to
+/// the people on air at those sites.
 pub fn schedule(seed: &Seed, s: &Session) -> String {
-    let mut out = String::from("target,from_utc,to_utc,word\n");
-    for t in s.word_targets() {
-        let name = match &t {
-            Target::Site(n) => n.clone(),
-            Target::Fox(n) => format!("fox {n}"),
-        };
+    let mut out = String::from("site,from_utc,to_utc,word\n");
+    for n in &s.word_sites {
+        let t = Target::Site(n.clone());
         for k in slots(s) {
             let from = slot_start(s, k);
             let to = slot_start(s, k + 1).min(s.end);
             let _ = writeln!(
                 out,
-                "{name},{},{},{}",
+                "{n},{},{},{}",
                 short_time(from),
                 short_time(to),
                 word(seed, &s.id, &t, k)
@@ -236,7 +310,10 @@ pub fn revealed(
 pub fn plausible(typed: &str) -> Result<()> {
     let n = normalize(typed);
     if n.len() < 4 || n.len() > 40 || typed.len() > 64 {
-        bail!("that doesn't look like a code word: two words and a number, like OTTER LANTERN 42");
+        bail!(
+            "that doesn't look like a code word (two words and a number, like OTTER LANTERN 42) \
+             or a fox code (like K7QM-3XRD-9PTW)"
+        );
     }
     Ok(())
 }
@@ -261,9 +338,37 @@ mod tests {
             sites: vec![],
             word_sites: vec!["park".into()],
             foxes: vec![],
+            nonce: "ab".into(),
             season: None,
             rules: Rules::default(),
         }
+    }
+
+    #[test]
+    fn fox_codes_are_distinct_and_read_back_loosely() {
+        let codes: BTreeSet<String> = (0..50)
+            .map(|n| fox_code(&[3; 32], "ab", "Fox 1", n))
+            .collect();
+        assert_eq!(codes.len(), 50);
+        let c = fox_code(&[3; 32], "ab", "Fox 1", 7);
+        assert_eq!(c.len(), 19, "16 characters in fours");
+        assert!(
+            c.bytes().all(|b| b == b'-' || CODE_CHARS.contains(&b)),
+            "{c}"
+        );
+        assert_ne!(c, fox_code(&[4; 32], "ab", "Fox 1", 7), "another seed");
+        assert_ne!(c, fox_code(&[3; 32], "cd", "Fox 1", 7), "another game");
+        assert_ne!(c, fox_code(&[3; 32], "ab", "Fox 2", 7), "another fox");
+
+        let h = code_hash("ab", "Fox 1", &c);
+        let sloppy = c
+            .to_lowercase()
+            .replace('-', " ")
+            .replace('0', "o")
+            .replace('1', "l");
+        assert_eq!(code_hash("ab", "Fox 1", &sloppy), h, "{sloppy}");
+        assert_ne!(code_hash("ab", "Fox 2", &c), h);
+        assert_ne!(code_hash("cd", "Fox 1", &c), h);
     }
 
     #[test]

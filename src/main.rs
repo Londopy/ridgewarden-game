@@ -61,6 +61,9 @@ enum Admin {
         /// a fox: NAME, or NAME=CALL for whoever runs it; repeat for more
         #[arg(long)]
         fox: Vec<String>,
+        /// one-time codes to leave with each fox: one for every hunter who may find it
+        #[arg(long, default_value_t = 30)]
+        codes: usize,
         /// end it by itself after this many minutes (default: a week)
         #[arg(long)]
         minutes: Option<i64>,
@@ -83,8 +86,15 @@ enum Admin {
         #[arg(long)]
         fox: Vec<String>,
     },
-    /// Print the running game's code words, to hand out or load into a fox
+    /// Print the running game's code words and fox codes again
     Words,
+    /// Set the key a callsign plays with, for a player who lost their passphrase or whose
+    /// callsign someone else used first (admins only)
+    PlayerKey {
+        call: String,
+        /// the key their passphrase makes, as the game page shows it after they post
+        key: String,
+    },
     /// Open or close a season; games started while one is open count towards it
     Season {
         #[command(subcommand)]
@@ -194,6 +204,7 @@ async fn admin(app: &App, cmd: Admin, config: &Path) -> Result<()> {
             sites,
             word_sites,
             fox,
+            codes,
             minutes,
         } => {
             if let Some(s) = running {
@@ -208,7 +219,7 @@ async fn admin(app: &App, cmd: Admin, config: &Path) -> Result<()> {
             let payload = json!({"name": name, "teams": teams, "sites": sites,
                 "word_sites": word_sites, "foxes": foxes, "season": season,
                 "rules": app.cfg.rules, "minutes": minutes});
-            start(app, payload).await
+            start(app, payload, codes).await
         }
         Admin::Teams {
             teams,
@@ -244,7 +255,27 @@ async fn admin(app: &App, cmd: Admin, config: &Path) -> Result<()> {
                     path.display()
                 )
             })?;
-            print!("{}", words::schedule(&seed, s));
+            if !s.word_sites.is_empty() {
+                print!("{}", words::schedule(&seed, s));
+            }
+            if !s.foxes.is_empty() {
+                print!("{}", words::codes(&seed, s));
+            }
+            Ok(())
+        }
+        Admin::PlayerKey { call, key } => {
+            let call = call.trim().to_ascii_uppercase();
+            if !valid_call(&call) {
+                bail!("{call:?} is not a callsign");
+            }
+            let key = key.trim().to_ascii_lowercase();
+            if !game::valid_key(&key) {
+                bail!("{key:?} is not a player key: 64 hex digits, as the game page shows it");
+            }
+            app.core
+                .append("game.key", json!({"call": call, "key": key}))
+                .await?;
+            println!("{call} now plays with key {key}.");
             Ok(())
         }
         Admin::Season { cmd } => season(app, cmd).await,
@@ -287,7 +318,20 @@ fn fox_places(s: &Session, args: &[String]) -> Result<BTreeMap<String, [f64; 2]>
     Ok(out)
 }
 
-async fn start(app: &App, payload: Value) -> Result<()> {
+async fn start(app: &App, mut payload: Value, codes: usize) -> Result<()> {
+    let has = |k: &str| payload[k].as_array().is_some_and(|a| !a.is_empty());
+    let foxes = has("foxes");
+    let seed = if foxes || has("word_sites") {
+        // made before the game starts, so a broken data folder stops it early
+        Some(words::seed(&words::seed_path(&app.cfg.data_dir))?)
+    } else {
+        None
+    };
+    if let Some(seed) = &seed
+        && foxes
+    {
+        add_codes(&mut payload, seed, codes)?;
+    }
     let st = Start::parse(&payload)?;
     let unsafe_sites: Vec<&String> = st
         .sites
@@ -312,35 +356,60 @@ async fn start(app: &App, payload: Value) -> Result<()> {
             "Warning: no core polls {n} over its LAN yet, so nobody can check in there until one does."
         );
     }
-    let words_needed = !st.word_sites.is_empty() || !st.foxes.is_empty();
-    if words_needed {
-        // made before the game starts, so a broken data folder stops it early
-        words::seed(&words::seed_path(&app.cfg.data_dir))?;
-    }
     let ev = app.core.append("game.start", payload).await?;
     println!("Started {} ({}).", st.name, &ev.id[..8]);
-    if words_needed {
-        write_schedule(app, &ev.id).await?;
+    if let Some(seed) = seed {
+        write_lists(app, &ev.id, &seed).await?;
     }
     Ok(())
 }
 
-/// Save the new game's code words next to the seed, for the admin to hand out.
-async fn write_schedule(app: &App, id: &str) -> Result<()> {
+/// Give each fox `n` one-time codes. Only their hashes go in the start event, with a
+/// fresh nonce so no two games share a code.
+fn add_codes(payload: &mut Value, seed: &words::Seed, n: usize) -> Result<()> {
+    if !(1..=game::CODES_MAX).contains(&n) {
+        bail!("--codes must be between 1 and {}", game::CODES_MAX);
+    }
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("no randomness for the nonce: {e}"))?;
+    let nonce = hex::encode(nonce);
+    for f in payload["foxes"].as_array_mut().into_iter().flatten() {
+        let name = f["name"].as_str().unwrap_or_default().to_string();
+        let hashes: Vec<String> = (0..n)
+            .map(|i| words::code_hash(&nonce, &name, &words::fox_code(seed, &nonce, &name, i)))
+            .collect();
+        f["codes"] = json!(hashes);
+    }
+    payload["nonce"] = json!(nonce);
+    Ok(())
+}
+
+/// Save the new game's code words and fox codes next to the seed, for the admin to hand
+/// out.
+async fn write_lists(app: &App, id: &str, seed: &words::Seed) -> Result<()> {
     ridgewarden_client::follow(&app.core, &app.db, PROJECTIONS).await?;
     let s = app
         .sessions()?
         .into_iter()
         .find(|s| s.id == id)
         .context("the new game isn't in the feed yet; run `ridgewarden-game words` shortly")?;
-    let seed = words::seed(&words::seed_path(&app.cfg.data_dir))?;
-    let path = app.cfg.data_dir.join(format!("words-{}.csv", &id[..8]));
-    std::fs::write(&path, words::schedule(&seed, &s))
-        .with_context(|| format!("writing {}", path.display()))?;
-    println!(
-        "Code words for every slot are in {}. Keep it private until each word is due on air.",
-        path.display()
-    );
+    let path = |name: &str| app.cfg.data_dir.join(format!("{name}-{}.csv", &id[..8]));
+    if !s.word_sites.is_empty() {
+        let p = path("words");
+        words::write_private(&p, words::schedule(seed, &s).as_bytes())?;
+        println!(
+            "Code words for every slot are in {}. Keep it private until each word is due on air.",
+            p.display()
+        );
+    }
+    if !s.foxes.is_empty() {
+        let p = path("codes");
+        words::write_private(&p, words::codes(seed, &s).as_bytes())?;
+        println!(
+            "Each fox's one-time codes are in {}. Print them and leave each fox's codes with it.",
+            p.display()
+        );
+    }
     Ok(())
 }
 

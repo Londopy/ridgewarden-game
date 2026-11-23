@@ -1,5 +1,6 @@
 //! Test helpers: a fake mesh of three check-in sites and a relay, and games played on it.
 
+use ed25519_dalek::{Signer, SigningKey};
 use ridgewarden_client::core::{Feed, FeedItem};
 use ridgewarden_client::mesh::Mesh;
 use ridgewarden_client::mesh::testing::Fake;
@@ -19,6 +20,23 @@ use crate::score::Minutes;
 use crate::score::Played;
 use crate::world::Seen;
 use crate::{PROJECTIONS, RESULTS_SCHEMA};
+
+/// A player's own key, the same for a callsign every time.
+pub fn player_key(call: &str) -> SigningKey {
+    SigningKey::from_bytes(blake3::hash(call.as_bytes()).as_bytes())
+}
+
+pub fn pk(key: &SigningKey) -> String {
+    hex::encode(key.verifying_key().to_bytes())
+}
+
+/// `payload` as a player's page posts it: with their key, signed by it.
+pub fn signed(kind: &str, mut payload: Value, key: &SigningKey) -> Value {
+    payload["pk"] = json!(pk(key));
+    let text = game::signed_text(kind, &payload).unwrap();
+    payload["psig"] = json!(hex::encode(key.sign(text.as_bytes()).to_bytes()));
+    payload
+}
 
 /// Midnight UTC, so tests about days start on a day boundary.
 pub const T0: i64 = 20_833 * DAY;
@@ -93,13 +111,13 @@ impl G {
         team: &str,
         site: &str,
     ) -> String {
-        self.f
-            .add(
-                "game.checkin",
-                json!({"session": session, "call": call, "team": team, "site": site}),
-                ts,
-            )
-            .id
+        let p = json!({"session": session, "call": call, "team": team, "site": site, "t": ts});
+        self.post(ts, "game.checkin", p, &player_key(call))
+    }
+
+    /// A player's post, signed with `key`, logged by our core.
+    pub fn post(&mut self, ts: i64, kind: &str, payload: Value, key: &SigningKey) -> String {
+        self.f.add(kind, signed(kind, payload, key), ts).id
     }
 
     /// An event from another station, applied straight to the projections.
@@ -128,10 +146,11 @@ impl G {
             minutes.touch(ts);
         }
         let s = self.sessions(now).into_iter().next().expect("a game");
-        crate::played(&self.f.conn, &s, now, now, minutes).unwrap()
+        let admins = std::slice::from_ref(&self.key);
+        crate::played(&self.f.conn, &s, now, now, admins, minutes).unwrap()
     }
 
-    /// A code word claim for a site or fox (`target` is {"site": ..} or {"fox": ..}).
+    /// A code word claim for a site, or a fox code (`target` is {"site": ..} or {"fox": ..}).
     pub fn word(
         &mut self,
         ts: i64,
@@ -141,11 +160,11 @@ impl G {
         target: Value,
         word: &str,
     ) {
-        let mut p = json!({"session": session, "call": call, "team": team, "word": word});
+        let mut p = json!({"session": session, "call": call, "team": team, "word": word, "t": ts});
         for (k, v) in target.as_object().unwrap() {
             p[k] = v.clone();
         }
-        self.f.add("game.word", p, ts);
+        self.post(ts, "game.word", p, &player_key(call));
     }
 
     pub fn reveal(&mut self, ts: i64, session: &str, target: Value, slot: i64, word: &str) {

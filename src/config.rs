@@ -179,8 +179,8 @@ admins = []
 # ["10.54.12.0/29"]. Leave it empty if this site isn't a check-in point.
 lan = []
 
-# Nodes that are safe and legal for players to visit: club-run sites, or public places
-# whose owners agree. Many nodes are on private land; `start` refuses any site not here.
+# Nodes that are safe and legal for players to visit: sites the mesh group runs, or public
+# places whose owners agree. Many nodes are on private land; `start` refuses any site not here.
 # Only needed on the admins' sites.
 safe_sites = []
 
@@ -200,11 +200,12 @@ builder_points = 2       # extra per minute for each new link in a chain
 builder_days = 3         # distinct days a new link must have been seen before it earns that
 builder_window_days = 90 # a link stops counting as new this many days after it first showed up
 fox_points = 20          # for finding a fox; whoever runs it gets encounter_points per finder
-word_min = 15            # how long each code word lasts at public sites and foxes
+word_min = 15            # how long each code word lasts at public sites
 max_speed_kmh = 100      # faster than this between two check-ins is an impossible hop
 strikes = 3              # impossible hops before a player is out of the game
 link_types = ["RF"]      # link types that join sites; add "DTD" to count cabled links
 fresh_s = 600            # link data older than this counts as unknown, and unknown doesn't score
+hold_min = 30            # a held site goes back to nobody once every link at it is down this long
 
 [site_names]
 # "tst-cuesta" = "Cuesta Peak"

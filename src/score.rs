@@ -1,12 +1,14 @@
 //! Scoring a session. Everything here is worked out from the log and the mesh's own link
 //! data, so every site that holds the same events shows the same leaderboard.
 //!
-//! Check-ins and code word claims are judged in time order. One that counts captures
-//! the site for the player's team, unless the team already holds it, or finds the fox.
-//! Every minute after the start, each team scores for its chains: two or more of its
-//! sites joined by links that are up at that minute. A dropped link breaks the chain at
-//! once, so its points stop until the link is back. Minutes already worked out are kept
-//! (`Minutes`) and only redone when new data could change them.
+//! First comes which links were up at each minute after the start. Then the check-ins,
+//! code words and fox codes are judged in time order, minute by minute: one that counts
+//! captures the site for the player's team, unless the team already holds it, or finds
+//! the fox, and a held site whose links have all been down for `hold_min` goes back to
+//! nobody. Then every minute each team scores for its chains: two or more of its sites
+//! joined by links that are up at that minute. A dropped link breaks the chain at once, so
+//! its points stop until the link is back. Minutes already worked out are kept (`Minutes`)
+//! and only redone when new data could change them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +19,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::chains::{Chain, chains};
-use crate::game::{self, Bearing, How, MIN, Play, Rules, Session, Spot, Target};
+use crate::game::{self, Bearing, How, Keys, MIN, Play, Rules, Session, Spot, Target};
 use crate::words::{self, Check};
 use crate::world::{Pos, World, km};
 
@@ -68,6 +70,14 @@ pub struct PlayerScore {
     pub sites: BTreeSet<String>,
 }
 
+/// A site that went back to nobody because its links were down.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Lost {
+    pub ts: i64,
+    pub site: String,
+    pub team: String,
+}
+
 /// A link that went down during the game.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Drop {
@@ -95,6 +105,9 @@ pub struct Played {
     pub known: BTreeSet<Edge>,
     pub positions: BTreeMap<String, Pos>,
     pub drops: Vec<Drop>,
+    /// oldest first
+    #[serde(default)]
+    pub lost: Vec<Lost>,
     pub bearings: Vec<Bearing>,
     pub spots: Vec<Spot>,
     /// LAN check-in sites no core polls over its LAN, so nobody can check in there
@@ -109,9 +122,16 @@ enum Verdict {
     Wait(String),
 }
 
+/// From `.0` on, site `.1` is held by team `.2`, or by nobody.
+type Change = (i64, String, Option<String>);
+
 #[derive(Default)]
 struct Judge {
+    keys: Keys,
+    reveals: Reveals,
     holder: BTreeMap<String, String>,
+    /// for each held site, when it was taken or last had a link up
+    linked: BTreeMap<String, i64>,
     captures: BTreeMap<(String, String), u32>,
     team_of: BTreeMap<String, String>,
     last: BTreeMap<String, (i64, String)>,
@@ -121,11 +141,14 @@ struct Judge {
     met: BTreeSet<(String, String)>,
     /// (callsign, target, slot) of every code word tried
     tried: BTreeSet<(String, String, i64)>,
+    /// hashes of the fox codes used
+    used: BTreeSet<String>,
     found: BTreeSet<(String, String)>,
     players: BTreeMap<String, PlayerScore>,
     teams: BTreeMap<String, TeamScore>,
-    /// (when, site, team) for each capture
-    changes: Vec<(i64, String, String)>,
+    /// captures, and sites going back to nobody
+    changes: Vec<Change>,
+    lost: Vec<Lost>,
 }
 
 fn ordinal(n: u32) -> String {
@@ -163,8 +186,12 @@ fn place(s: &Session, w: &World, p: &Play) -> Option<Verdict> {
 }
 
 impl Judge {
-    fn new(s: &Session) -> Self {
-        let mut j = Judge::default();
+    fn new(s: &Session, keys: Keys, reveals: Reveals) -> Self {
+        let mut j = Judge {
+            keys,
+            reveals,
+            ..Default::default()
+        };
         for t in &s.teams {
             j.teams.insert(
                 t.clone(),
@@ -177,16 +204,33 @@ impl Judge {
         j
     }
 
-    /// For a code word claim: one try per word, and the word must match its slot's.
-    fn proof(&mut self, s: &Session, rv: &Reveals, p: &Play) -> Option<Verdict> {
+    /// Whether a play was signed by the key its callsign plays with, or by any player key
+    /// while the callsign has none.
+    fn signed(&self, p: &Play) -> Option<Verdict> {
+        match (&p.key, self.keys.get(&p.call)) {
+            (None, _) => Some(Verdict::No("not signed with the player's own key".into())),
+            (Some(k), Some(bound)) if k != bound => Some(Verdict::No(format!(
+                "signed with a key that isn't {}'s",
+                p.call
+            ))),
+            _ => None,
+        }
+    }
+
+    /// For a code word claim: one try per word, and the word must match its slot's. For a
+    /// fox, one of its codes that nobody has used.
+    fn proof(&mut self, s: &Session, p: &Play) -> Option<Verdict> {
         let How::Word { word } = &p.how else {
             return None;
         };
+        if let Target::Fox(fox) = &p.target {
+            return self.redeem(s, &p.call, fox, word);
+        }
         let slot = words::slot_of(s, p.ts);
         if !self.tried.insert((p.call.clone(), p.target.key(), slot)) {
             return Some(Verdict::No("one try per code word".into()));
         }
-        match words::check(s, rv, &p.target, p.ts, word) {
+        match words::check(s, &self.reveals, &p.target, p.ts, word) {
             Check::Right => None,
             Check::Wrong => Some(Verdict::No("wrong code word".into())),
             Check::Late => Some(Verdict::No(
@@ -196,6 +240,43 @@ impl Judge {
                 "waiting for the word to be revealed after {}",
                 &short_time(t)[11..]
             ))),
+        }
+    }
+
+    /// A fox code counts once, for the first player to send it, and a player finds each fox
+    /// once; a second find doesn't use up the code.
+    fn redeem(&mut self, s: &Session, call: &str, fox: &str, typed: &str) -> Option<Verdict> {
+        if self.found.contains(&(call.to_string(), fox.to_string())) {
+            return Some(Verdict::No(format!("already found {fox}")));
+        }
+        let hash = words::code_hash(&s.nonce, fox, typed);
+        if !s.fox(fox).is_some_and(|f| f.codes.contains(&hash)) {
+            return Some(Verdict::No(format!("not one of {fox}'s codes")));
+        }
+        if !self.used.insert(hash) {
+            return Some(Verdict::No("that code was already used".into()));
+        }
+        None
+    }
+
+    /// At minute `t`, with `up` the game sites that have a link up: a held site whose
+    /// links have all been down for `hold_min` since it was taken or last had one up goes
+    /// back to nobody.
+    fn decay(&mut self, s: &Session, t: i64, up: &BTreeSet<&str>) {
+        let mut gone = vec![];
+        for (site, since) in &mut self.linked {
+            if up.contains(site.as_str()) {
+                *since = t;
+            } else if t - *since >= s.rules.hold_min * MIN {
+                gone.push(site.clone());
+            }
+        }
+        for site in gone {
+            self.linked.remove(&site);
+            if let Some(team) = self.holder.remove(&site) {
+                self.changes.push((t, site.clone(), None));
+                self.lost.push(Lost { ts: t, site, team });
+            }
         }
     }
 
@@ -229,11 +310,11 @@ impl Judge {
         )))
     }
 
-    fn judge(&mut self, s: &Session, w: &World, rv: &Reveals, p: &Play) -> Verdict {
+    fn judge(&mut self, s: &Session, w: &World, p: &Play) -> Verdict {
         if p.ts < s.start || p.ts > s.end {
             return Verdict::No("outside the game's time".into());
         }
-        if let Some(v) = place(s, w, p) {
+        if let Some(v) = place(s, w, p).or_else(|| self.signed(p)) {
             return v;
         }
         if !s.teams.contains(&p.team) {
@@ -251,7 +332,7 @@ impl Judge {
         if self.strikes.get(&p.call).copied().unwrap_or(0) >= limit {
             return Verdict::No(format!("out of this game after {limit} impossible hops"));
         }
-        self.proof(s, rv, p)
+        self.proof(s, p)
             .or_else(|| self.travel(s, w, p))
             .unwrap_or(Verdict::Count)
     }
@@ -304,7 +385,9 @@ impl Judge {
             self.player(&p.call, &p.team).captures += 1;
             self.credit(&p.call, &p.team, worth);
             self.holder.insert(site.to_string(), p.team.clone());
-            self.changes.push((p.ts, site.to_string(), p.team.clone()));
+            self.linked.insert(site.to_string(), p.ts);
+            self.changes
+                .push((p.ts, site.to_string(), Some(p.team.clone())));
             notes.push(if n == 1 {
                 format!("captured for {}", p.team)
             } else {
@@ -356,9 +439,7 @@ impl Judge {
 
     /// A fox found: points to the finder, and to whoever runs the fox, once per finder.
     fn find(&mut self, s: &Session, p: &Play, fox: &str) -> (i64, String) {
-        if !self.found.insert((p.call.clone(), fox.to_string())) {
-            return (0, format!("already found {fox}"));
-        }
+        self.found.insert((p.call.clone(), fox.to_string()));
         let pts = s.rules.fox_points;
         self.player(&p.call, &p.team).finds += 1;
         self.teams.entry(p.team.clone()).or_default().fox += pts;
@@ -383,18 +464,28 @@ impl Judge {
         (pts, note)
     }
 
-    /// Judge every play up to `at`, in order.
+    /// Judge every play up to `at`, in order, letting held sites decay minute by minute in
+    /// between. `up[i]` is the game sites with a link up at start + (i + 1) minutes.
     fn judge_all(
         &mut self,
         s: &Session,
         w: &World,
-        rv: &Reveals,
         plays: &[Play],
+        up: &[BTreeSet<&str>],
         at: i64,
     ) -> Vec<Judged> {
         let mut out = vec![];
+        let mut minutes = up
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (s.start + (i as i64 + 1) * MIN, u))
+            .peekable();
         for p in plays.iter().filter(|p| p.ts <= at) {
-            let (counted, pending, points, note) = match self.judge(s, w, rv, p) {
+            // a site that decays at the very moment of a check-in is free for it to take
+            while let Some((t, u)) = minutes.next_if(|(t, _)| *t <= p.ts) {
+                self.decay(s, t, u);
+            }
+            let (counted, pending, points, note) = match self.judge(s, w, p) {
                 Verdict::No(why) => (false, false, 0, why),
                 Verdict::Wait(why) => (false, true, 0, why),
                 Verdict::Count => {
@@ -414,6 +505,9 @@ impl Judge {
                 points,
                 note,
             });
+        }
+        for (t, u) in minutes {
+            self.decay(s, t, u);
         }
         out
     }
@@ -457,7 +551,6 @@ struct Minute {
     points: Vec<(i64, i64)>,
     /// biggest chain per team
     best: Vec<usize>,
-    up: BTreeSet<u32>,
     /// (team index, link) for every link in a chain
     chained: BTreeSet<(usize, u32)>,
 }
@@ -466,19 +559,30 @@ struct Minute {
 /// minute is redone.
 type Shape = (i64, i64, Vec<String>, Vec<String>, Rules);
 
-/// The minutes of one session worked out so far. Kept between page views; new polls
-/// from before the last minute, or a change in who held what when, drop the minutes from
-/// then on, and only those are worked out again.
+/// The minutes of one session worked out so far, kept between page views: which links
+/// were up in each, and what each scored. New polls from before the last minute drop
+/// both from then on; a change in who held what when drops the scores from then on.
+/// Only the minutes dropped are worked out again.
 #[derive(Default)]
 pub struct Minutes {
     shape: Option<Shape>,
-    changes: Vec<(i64, String, String)>,
+    changes: Vec<Change>,
     edges: Vec<Edge>,
     ids: BTreeMap<Edge, u32>,
-    /// minute i is at start + (i + 1) minutes
+    /// the links up in each minute; minute i is at start + (i + 1) minutes
+    ups: Vec<BTreeSet<u32>>,
+    /// the minutes scored, never more than `ups`
     done: Vec<Minute>,
     /// the oldest new poll since the last run
     dirty: Option<i64>,
+}
+
+/// How many of the first `len` minutes come before `cut`: minute i, at start + (i + 1)
+/// minutes, sees everything up to it.
+fn before(s: &Session, cut: i64, len: usize) -> usize {
+    cut.saturating_sub(s.start + 1)
+        .div_euclid(MIN)
+        .clamp(0, len as i64) as usize
 }
 
 impl Minutes {
@@ -487,8 +591,9 @@ impl Minutes {
         self.dirty = Some(self.dirty.map_or(ts, |d| d.min(ts)));
     }
 
-    /// Drop what can no longer be trusted.
-    fn invalidate(&mut self, s: &Session, changes: &[(i64, String, String)]) {
+    /// Start again if the session changed shape, and drop the minutes that polls which
+    /// arrived since the last run could change.
+    fn refresh(&mut self, s: &Session) {
         let shape: Shape = (
             s.start,
             s.end,
@@ -502,6 +607,16 @@ impl Minutes {
                 ..Default::default()
             };
         }
+        if let Some(cut) = self.dirty.take() {
+            let keep = before(s, cut, self.ups.len());
+            self.ups.truncate(keep);
+            self.done.truncate(keep);
+        }
+    }
+
+    /// Take the latest captures and losses; minutes scored from the first one that
+    /// differs on are scored again.
+    fn rescore(&mut self, s: &Session, changes: &[Change]) {
         let differ = self
             .changes
             .iter()
@@ -513,19 +628,15 @@ impl Minutes {
             .flatten()
             .map(|c| c.0)
             .min();
-        if let Some(cut) = [changed, self.dirty.take()].into_iter().flatten().min() {
-            // minute i at start + (i + 1) min sees everything up to it, so keep those before
-            let keep = cut
-                .saturating_sub(s.start + 1)
-                .div_euclid(MIN)
-                .clamp(0, self.done.len() as i64);
-            self.done.truncate(keep as usize);
+        if let Some(cut) = changed {
+            let keep = before(s, cut, self.done.len());
+            self.done.truncate(keep);
         }
         self.changes = changes.to_vec();
     }
 
     fn next(&self, s: &Session) -> i64 {
-        s.start + (self.done.len() as i64 + 1) * MIN
+        s.start + (self.ups.len() as i64 + 1) * MIN
     }
 
     fn id(&mut self, e: &Edge) -> u32 {
@@ -538,20 +649,52 @@ impl Minutes {
         i
     }
 
-    /// Work out every minute from the first missing one up to `at`.
-    fn run(&mut self, s: &Session, w: &World, at: i64) {
-        let mut holders = BTreeMap::new();
-        let mut changes = self.changes.clone().into_iter().peekable();
+    /// Work out which links were up in each minute from the first missing one up to `at`.
+    fn find_ups(&mut self, s: &Session, w: &World, at: i64) {
         let mut t = self.next(s);
         while t <= at {
+            let up = w.up_at(t, &s.rules).iter().map(|e| self.id(e)).collect();
+            self.ups.push(up);
+            t += MIN;
+        }
+    }
+
+    /// For each minute worked out, the game sites with a link up.
+    fn linked<'a>(&'a self, sites: &[String]) -> Vec<BTreeSet<&'a str>> {
+        self.ups
+            .iter()
+            .map(|up| {
+                up.iter()
+                    .flat_map(|e| {
+                        let (a, b) = &self.edges[*e as usize];
+                        [a, b]
+                    })
+                    .filter(|n| sites.contains(n))
+                    .map(String::as_str)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Score every minute whose links are known and that isn't scored yet.
+    fn score(&mut self, s: &Session, w: &World) {
+        let mut holders = BTreeMap::new();
+        let mut changes = self.changes.iter().peekable();
+        for i in self.done.len()..self.ups.len() {
+            let t = s.start + (i as i64 + 1) * MIN;
             while let Some((_, site, team)) = changes.next_if(|(ts, ..)| *ts <= t) {
-                holders.insert(site, team);
+                match team {
+                    Some(team) => holders.insert(site.clone(), team.clone()),
+                    None => holders.remove(site),
+                };
             }
-            let up = w.up_at(t, &s.rules);
+            let up: BTreeSet<Edge> = self.ups[i]
+                .iter()
+                .map(|e| self.edges[*e as usize].clone())
+                .collect();
             let mut m = Minute {
                 points: vec![(0, 0); s.teams.len()],
                 best: vec![0; s.teams.len()],
-                up: up.iter().map(|e| self.id(e)).collect(),
                 chained: BTreeSet::new(),
             };
             for c in all_chains(s, w, &holders, &up, t) {
@@ -563,24 +706,22 @@ impl Minutes {
                 m.points[ti].1 += builder;
                 m.best[ti] = m.best[ti].max(c.sites.len());
                 for e in &c.links {
-                    let id = self.id(e);
-                    m.chained.insert((ti, id));
+                    m.chained.insert((ti, self.ids[e]));
                 }
             }
             self.done.push(m);
-            t += MIN;
         }
     }
 
-    /// Links that went down during the game, from the minutes worked out.
+    /// Links that went down during the game, from the minutes scored.
     fn drops(&self, s: &Session) -> Vec<Drop> {
         let mut out: Vec<Drop> = vec![];
         let mut open: BTreeMap<u32, usize> = BTreeMap::new();
-        for (i, m) in self.done.iter().enumerate() {
+        for i in 0..self.done.len() {
             let t = s.start + (i as i64 + 1) * MIN;
-            if let Some(prev) = i.checked_sub(1).map(|p| &self.done[p]) {
-                for e in prev.up.difference(&m.up) {
-                    let broke = prev
+            if let Some(p) = i.checked_sub(1) {
+                for e in self.ups[p].difference(&self.ups[i]) {
+                    let broke = self.done[p]
                         .chained
                         .iter()
                         .filter(|(_, x)| x == e)
@@ -595,7 +736,7 @@ impl Minutes {
                     });
                 }
             }
-            for e in &m.up {
+            for e in &self.ups[i] {
                 if let Some(d) = open.remove(e) {
                     out[d].to = Some(t);
                 }
@@ -605,11 +746,11 @@ impl Minutes {
         out
     }
 
-    /// Every link that was up in some scored minute.
+    /// Every link that was up in some minute worked out.
     fn ever_up(&self) -> BTreeSet<Edge> {
-        self.done
+        self.ups
             .iter()
-            .flat_map(|m| &m.up)
+            .flatten()
             .map(|e| self.edges[*e as usize].clone())
             .collect()
     }
@@ -618,22 +759,31 @@ impl Minutes {
 /// Polls are loaded this many minutes at a time, so a long game doesn't hold them all.
 const CHUNK: i64 = 6 * 60;
 
-/// Score session `s` as of `now`, reusing and extending `minutes`.
-pub fn play(conn: &Connection, s: &Session, now: i64, minutes: &mut Minutes) -> Result<Played> {
+/// Score session `s` as of `now` with the players' keys `keys`, reusing and extending
+/// `minutes`.
+pub fn play(
+    conn: &Connection,
+    s: &Session,
+    now: i64,
+    keys: &Keys,
+    minutes: &mut Minutes,
+) -> Result<Played> {
     let at = s.end.min(now);
     let mut w = World::places(conn)?;
-    let reveals = game::reveals(conn, s)?;
-    let mut j = Judge::new(s);
-    let checkins = j.judge_all(s, &w, &reveals, &game::plays(conn, &s.id)?, at);
-    minutes.invalidate(s, &j.changes);
-    // the map wants the last hour of links, and each minute the polls before it
+    minutes.refresh(s);
+    // each minute needs the polls from a little before it
     let fresh = 2 * s.rules.fresh_s * 1000;
     while minutes.next(s) <= at {
         let from = minutes.next(s);
         let to = (from + CHUNK * MIN).min(at);
         w.load_polls(conn, from - fresh, to)?;
-        minutes.run(s, &w, to);
+        minutes.find_ups(s, &w, to);
     }
+    let mut j = Judge::new(s, keys.clone(), game::reveals(conn, s)?);
+    let plays = game::plays(conn, &s.id)?;
+    let checkins = j.judge_all(s, &w, &plays, &minutes.linked(&s.all_sites()), at);
+    minutes.rescore(s, &j.changes);
+    minutes.score(s, &w);
     // the map shows the last hour of links as well as every link up during the game
     let recent = (at - 60 * MIN).max(s.start);
     w.load_polls(conn, recent - fresh, at)?;
@@ -678,8 +828,9 @@ pub fn play(conn: &Connection, s: &Session, now: i64, minutes: &mut Minutes) -> 
         links_pruned: w.oldest_poll.is_none_or(|o| o > s.start),
         known,
         drops: minutes.drops(s),
-        bearings: game::bearings(conn, s)?,
-        spots: game::spots(conn, &s.id)?,
+        lost: j.lost,
+        bearings: game::bearings(conn, s, keys)?,
+        spots: game::spots(conn, &s.id, keys)?,
         positions: w.positions,
         session: s.clone(),
         at,
@@ -696,7 +847,8 @@ pub fn play(conn: &Connection, s: &Session, now: i64, minutes: &mut Minutes) -> 
 mod tests {
     use super::*;
     use crate::game::DAY;
-    use crate::testing::{G, T0, player, team};
+    use crate::testing::{G, T0, pk, player, player_key, signed, team};
+    use ed25519_dalek::SigningKey;
     use serde_json::json;
 
     #[test]
@@ -800,7 +952,8 @@ mod tests {
     fn impossible_hops_warn_then_strike_out() {
         let mut g = G::new();
         g.poll(T0 - MIN, "a", &[]);
-        g.poll(T0 - MIN, "c", &[]);
+        // c keeps a link up, so whoever takes it still holds it at the end
+        g.polls(T0 - MIN, T0 + 100 * MIN, "c", &["r"]);
         let s = g.start(T0, json!({}));
         // a to c is 55 km: 33 minutes at 100 km/h
         g.checkin(T0 + MIN, &s, "N0AAA", "Red", "a");
@@ -833,11 +986,14 @@ mod tests {
     #[test]
     fn check_ins_count_only_when_signed_by_the_sites_own_core() {
         let other = "ab".repeat(32);
+        let checkin = |s: &str| {
+            let p = json!({"session": s, "call": "N0AAA", "team": "Red", "site": "a", "t": T0});
+            signed("game.checkin", p, &player_key("N0AAA"))
+        };
         let mut g = G::new();
         g.poll(T0 - MIN, "a", &[]);
         let s = g.start(T0, json!({}));
-        let payload = json!({"session": s, "call": "N0AAA", "team": "Red", "site": "a"});
-        g.add_as(&other, 1000, "game.checkin", payload, T0 + MIN);
+        g.add_as(&other, 1000, "game.checkin", checkin(&s), T0 + MIN);
         let p = g.played(T0 + 2 * MIN);
         assert!(!p.checkins[0].counted);
         assert!(p.checkins[0].note.contains("countersigned"));
@@ -847,8 +1003,7 @@ mod tests {
         let poll = json!({"node": "a", "ok": true, "via": "lan"});
         g.add_as(&other, 999, "node.poll", poll, T0);
         let s = g.start(T0, json!({}));
-        let payload = json!({"session": s, "call": "N0AAA", "team": "Red", "site": "a"});
-        g.add_as(&other, 1000, "game.checkin", payload, T0 + MIN);
+        g.add_as(&other, 1000, "game.checkin", checkin(&s), T0 + MIN);
         assert!(g.played(T0 + 2 * MIN).checkins[0].counted);
 
         // a core that only crawls a node isn't that node's core
@@ -856,9 +1011,207 @@ mod tests {
         let poll = json!({"node": "a", "ok": true, "via": "crawl"});
         g.add_as(&other, 999, "node.poll", poll, T0);
         let s = g.start(T0, json!({}));
-        let payload = json!({"session": s, "call": "N0AAA", "team": "Red", "site": "a"});
-        g.add_as(&other, 1000, "game.checkin", payload, T0 + MIN);
+        g.add_as(&other, 1000, "game.checkin", checkin(&s), T0 + MIN);
         assert!(!g.played(T0 + 2 * MIN).checkins[0].counted);
+    }
+
+    #[test]
+    fn plays_count_only_when_signed_by_the_key_the_callsign_plays_with() {
+        let notes = |p: &Played| -> Vec<(String, String, bool)> {
+            p.checkins
+                .iter()
+                .map(|c| (c.call.clone(), c.note.clone(), c.counted))
+                .collect()
+        };
+        let mut g = G::new();
+        let s = g.start(T0, json!({}));
+        let (mine, thief) = (player_key("N0AAA"), SigningKey::from_bytes(&[5; 32]));
+        let at = |site: &str, ts: i64| json!({"session": s, "call": "N0AAA", "team": "Red", "site": site, "t": ts});
+        // a check-in on a site's LAN makes its key the callsign's
+        g.post(T0 + MIN, "game.checkin", at("a", T0 + MIN), &mine);
+        g.post(T0 + 2 * MIN, "game.checkin", at("b", T0 + 2 * MIN), &thief);
+        // a post without the player's signature, and one whose signature is for other text
+        let unsigned = json!({"session": s, "call": "N0CCC", "team": "Red", "site": "c"});
+        g.f.add("game.checkin", unsigned, T0 + 3 * MIN);
+        let mut forged = signed("game.checkin", at("c", T0 + 4 * MIN), &mine);
+        forged["site"] = json!("b");
+        g.f.add("game.checkin", forged, T0 + 4 * MIN);
+        let p = g.played(T0 + 5 * MIN);
+        let n = notes(&p);
+        assert!(n[0].2, "{n:?}");
+        assert_eq!(n[1].1, "signed with a key that isn't N0AAA's");
+        assert_eq!(n[2].1, "not signed with the player's own key");
+        assert_eq!(n[3].1, "not signed with the player's own key");
+        assert!(n.iter().skip(1).all(|x| !x.2));
+        assert_eq!(p.holders.get("b"), None);
+
+        // the same signed post sent on again counts once, also with its signature shouted
+        let replay = signed("game.checkin", at("c", T0 + 6 * MIN), &mine);
+        let mut shouted = replay.clone();
+        shouted["psig"] = json!(replay["psig"].as_str().unwrap().to_uppercase());
+        g.f.add("game.checkin", replay.clone(), T0 + 6 * MIN);
+        g.f.add("game.checkin", replay, T0 + 7 * MIN);
+        g.f.add("game.checkin", shouted, T0 + 7 * MIN + 1);
+        assert_eq!(g.played(T0 + 8 * MIN).checkins.len(), 5);
+
+        // an admin can give the callsign to the other key; nobody else can
+        let other_admin = "ef".repeat(32);
+        let set = json!({"call": "N0AAA", "key": pk(&mine)});
+        g.add_as(&other_admin, 1000, "game.key", set, T0 + 8 * MIN);
+        let set = json!({"call": "N0AAA", "key": pk(&thief)});
+        g.f.add("game.key", set, T0 + 9 * MIN);
+        let n = notes(&g.played(T0 + 10 * MIN));
+        assert_eq!(n[0].1, "signed with a key that isn't N0AAA's");
+        assert!(n[1].2, "{n:?}");
+    }
+
+    fn keys_of(g: &G) -> game::Keys {
+        game::keys(&g.f.conn, std::slice::from_ref(&g.key)).unwrap()
+    }
+
+    #[test]
+    fn a_post_from_afar_doesnt_take_a_callsign_but_a_lan_check_in_does() {
+        let mut g = G::new();
+        let s = g.start(T0, json!({"foxes": [{"name": "Fox 1"}]}));
+        let (mine, thief) = (player_key("N0AAA"), SigningKey::from_bytes(&[5; 32]));
+        let spot = |text: &str| json!({"session": s, "call": "N0AAA", "text": text, "t": T0});
+        // first with the callsign, but from anywhere: shown while the callsign has no key
+        g.post(T0 + MIN, "game.spot", spot("not me"), &thief);
+        assert_eq!(g.played(T0 + 2 * MIN).spots.len(), 1);
+        assert_eq!(keys_of(&g).get("N0AAA"), None);
+        g.checkin(T0 + 2 * MIN, &s, "N0AAA", "Red", "a");
+        assert_eq!(keys_of(&g).get("N0AAA"), Some(&pk(&mine)));
+        g.post(T0 + 3 * MIN, "game.spot", spot("heading north"), &mine);
+        let bearing = json!({"session": s, "call": "N0AAA", "fox": "Fox 1", "lat": "35.30000",
+            "lon": "-120.66000", "deg": "45.0", "t": T0});
+        g.post(T0 + 4 * MIN, "game.bearing", bearing.clone(), &thief);
+        g.post(T0 + 5 * MIN, "game.bearing", bearing, &mine);
+        let p = g.played(T0 + 6 * MIN);
+        let texts: Vec<&str> = p.spots.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, ["heading north"]);
+        assert_eq!(p.bearings.len(), 1);
+        assert_eq!((p.bearings[0].ts, p.bearings[0].deg), (T0 + 5 * MIN, 45.0));
+        assert_eq!(
+            p.bearings[0].from,
+            crate::world::Pos::new(35.3, -120.66).unwrap()
+        );
+    }
+
+    #[test]
+    fn with_a_roster_only_rostered_callsigns_get_keys() {
+        let mut g = G::new();
+        let s = g.start(T0, json!({}));
+        let teams = json!({"session": s, "teams": ["Red", "Blue"], "roster": {"N0AAA": "Red"}});
+        g.f.add("game.teams", teams, T0 + MIN);
+        let spot = |call: &str| json!({"session": s, "call": call, "text": "here", "t": T0});
+        g.post(
+            T0 + 2 * MIN,
+            "game.spot",
+            spot("N0VIC"),
+            &SigningKey::from_bytes(&[5; 32]),
+        );
+        g.post(
+            T0 + 3 * MIN,
+            "game.spot",
+            spot("N0AAA"),
+            &player_key("N0AAA"),
+        );
+        let keys = keys_of(&g);
+        assert_eq!(keys.get("N0VIC"), None, "not on the roster");
+        assert_eq!(
+            keys.get("N0AAA"),
+            Some(&pk(&player_key("N0AAA"))),
+            "on it, from anywhere"
+        );
+    }
+
+    #[test]
+    fn the_first_check_in_is_first_by_lamport_not_by_a_cores_clock() {
+        let mut g = G::new();
+        let s = g.start(T0, json!({}));
+        let slow = "ab".repeat(32);
+        g.add_as(
+            &slow,
+            900,
+            "node.poll",
+            json!({"node": "b", "ok": true, "via": "lan"}),
+            T0,
+        );
+        let checkin = |site: &str, key: &SigningKey| {
+            let p = json!({"session": s, "call": "N0AAA", "team": "Red", "site": site, "t": T0});
+            signed("game.checkin", p, key)
+        };
+        let (owner, late) = (player_key("N0AAA"), SigningKey::from_bytes(&[5; 32]));
+        let ours = g.key.clone();
+        g.add_as(
+            &ours,
+            1000,
+            "game.checkin",
+            checkin("a", &owner),
+            T0 + 10 * MIN,
+        );
+        // logged after it, by a core whose clock is behind
+        g.add_as(&slow, 1001, "game.checkin", checkin("b", &late), T0 + MIN);
+        assert_eq!(keys_of(&g).get("N0AAA"), Some(&pk(&owner)));
+    }
+
+    #[test]
+    fn a_held_site_goes_back_to_nobody_once_its_links_stay_down() {
+        let mut g = G::new();
+        g.polls(T0 - 10 * MIN, T0 + 20 * MIN, "a", &["b"]);
+        g.polls(T0 + 21 * MIN, T0 + 90 * MIN, "a", &[]);
+        // c's link drops for 20 minutes at a time, never for the full half hour
+        g.polls(T0, T0 + 10 * MIN, "c", &["r"]);
+        g.polls(T0 + 11 * MIN, T0 + 30 * MIN, "c", &[]);
+        g.polls(T0 + 31 * MIN, T0 + 32 * MIN, "c", &["r"]);
+        g.polls(T0 + 33 * MIN, T0 + 52 * MIN, "c", &[]);
+        g.polls(T0 + 53 * MIN, T0 + 90 * MIN, "c", &["r"]);
+        let s = g.start(T0, json!({}));
+        g.checkin(T0 + MIN, &s, "N0AAA", "Red", "a");
+        g.checkin(T0 + MIN, &s, "N0BBB", "Red", "b");
+        g.checkin(T0 + MIN, &s, "N0CCC", "Red", "c");
+
+        // a-b is up until +21; the last minute either had a link was +21
+        let p = g.played(T0 + 50 * MIN);
+        assert_eq!((p.holders.len(), p.lost.len()), (3, 0));
+        let p = g.played(T0 + 51 * MIN);
+        let lost: Vec<(i64, &str, &str)> = p
+            .lost
+            .iter()
+            .map(|l| (l.ts, l.site.as_str(), l.team.as_str()))
+            .collect();
+        assert_eq!(
+            lost,
+            [(T0 + 51 * MIN, "a", "Red"), (T0 + 51 * MIN, "b", "Red")]
+        );
+        assert_eq!(p.holders.keys().collect::<Vec<_>>(), ["c"]);
+        assert_eq!(team(&p, "Red").held, 1);
+
+        // lost is lost: taking it again is a capture, and a repeat one for Red
+        g.checkin(T0 + 55 * MIN, &s, "N0DDD", "Blue", "a");
+        g.checkin(T0 + 56 * MIN, &s, "N0BBB", "Red", "b");
+        let p = g.played(T0 + 60 * MIN);
+        let pts: Vec<(&str, i64)> = p.checkins[3..]
+            .iter()
+            .map(|c| (c.note.as_str(), c.points))
+            .collect();
+        assert_eq!(
+            pts,
+            [
+                ("captured for Blue", 10),
+                ("captured for Red (2nd time)", 5)
+            ]
+        );
+        assert_eq!(p.holders["a"], "Blue");
+
+        // the hold comes from the rules; with no polls after +20, the link counts as up
+        // until its data is 10 minutes old, at +30
+        let mut g = G::new();
+        g.polls(T0 - 10 * MIN, T0 + 20 * MIN, "a", &["b"]);
+        let s = g.start(T0, json!({"rules": {"hold_min": 60}}));
+        g.checkin(T0 + MIN, &s, "N0AAA", "Red", "a");
+        assert!(g.played(T0 + 89 * MIN).lost.is_empty());
+        assert_eq!(g.played(T0 + 90 * MIN).lost.len(), 1);
     }
 
     #[test]
@@ -880,6 +1233,7 @@ mod tests {
             &session,
             T0 + 7 * MIN,
             0,
+            &admins,
             &mut Minutes::default(),
         );
         assert!(p.unwrap().checkins[0].pending);
@@ -1018,6 +1372,7 @@ mod tests {
             &session,
             T0 + 3 * 60 * MIN,
             T0 + 30 * MIN,
+            std::slice::from_ref(&g.key),
             &mut m,
         )
         .unwrap();
@@ -1083,52 +1438,54 @@ mod tests {
     }
 
     #[test]
-    fn a_fox_find_pays_the_finder_and_whoever_runs_it() {
+    fn a_fox_is_found_with_one_of_its_codes_and_each_code_counts_once() {
         let mut g = G::new();
+        let codes = ["AAAA-BBBB-CCCC", "DDDD-EEEE-FFFF", "GGGG-HHHH-JJJJ"];
+        let hashes: Vec<String> = codes
+            .iter()
+            .map(|c| words::code_hash("ab", "Fox 1", c))
+            .collect();
         let s = g.start(
             T0,
-            json!({"foxes": [{"name": "Fox 1", "call": "N0FOX"}], "rules": {"encounter_points": 3}}),
+            json!({"nonce": "ab", "foxes": [{"name": "Fox 1", "call": "N0FOX", "codes": hashes}],
+                "rules": {"encounter_points": 3}}),
         );
         let fox = json!({"fox": "Fox 1"});
-        g.word(
-            T0 + 5 * MIN,
-            &s,
-            "N0AAA",
-            "Red",
-            fox.clone(),
-            "CEDAR MESA 77",
+        let mut try_code = |ts: i64, call: &str, team: &str, code: &str| {
+            g.word(T0 + ts * MIN, &s, call, team, fox.clone(), code)
+        };
+        try_code(5, "N0AAA", "Red", "aaaa bbbb cccc");
+        // passed on to someone else, it's already spent
+        try_code(6, "N0BBB", "Blue", "AAAA-BBBB-CCCC");
+        try_code(7, "N0BBB", "Blue", "DDDD-EEEE-FFFX");
+        // a second find doesn't use up a code, so it's still good for someone else
+        try_code(8, "N0AAA", "Red", "GGGG-HHHH-JJJJ");
+        try_code(9, "N0CCC", "Blue", "GGGG-HHHH-JJJJ");
+        let p = g.played(T0 + 10 * MIN);
+        let notes: Vec<(&str, bool)> = p
+            .checkins
+            .iter()
+            .map(|c| (c.note.as_str(), c.counted))
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                ("found Fox 1; 3 to N0FOX, who runs it", true),
+                ("that code was already used", false),
+                ("not one of Fox 1's codes", false),
+                ("already found Fox 1", false),
+                ("found Fox 1; 3 to N0FOX, who runs it", true),
+            ]
         );
-        g.word(
-            T0 + 10 * MIN,
-            &s,
-            "N0BBB",
-            "Blue",
-            fox.clone(),
-            "CEDAR MESA 77",
-        );
-        // a minute into the next slot the old word still counts, but N0AAA already found it
-        g.word(
-            T0 + 16 * MIN,
-            &s,
-            "N0AAA",
-            "Red",
-            fox.clone(),
-            "CEDAR MESA 77",
-        );
-        g.reveal(T0 + 17 * MIN, &s, fox, 0, "CEDAR MESA 77");
-        let p = g.played(T0 + 18 * MIN);
         assert_eq!(player(&p, "N0AAA").points, 20);
         assert_eq!(player(&p, "N0AAA").finds, 1);
-        assert_eq!(player(&p, "N0BBB").points, 20);
-        assert_eq!(p.checkins[2].note, "already found Fox 1");
         let op = player(&p, "N0FOX");
         assert_eq!(
             (op.points, op.team.as_str()),
             (6, ""),
             "3 for each of two finders"
         );
-        assert_eq!(team(&p, "Red").fox, 20);
-        assert_eq!(team(&p, "Red").total, 20);
+        assert_eq!((team(&p, "Red").fox, team(&p, "Blue").fox), (20, 20));
         assert!(p.holders.is_empty(), "a fox isn't territory");
 
         // after the game an admin says where it was, for the map

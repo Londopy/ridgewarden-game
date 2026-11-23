@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use crate::App;
 use crate::archive::{Award, Record, SeasonView};
+use crate::game;
 use crate::web::{Fail, STYLE, page};
 
 fn archive_nav() -> &'static str {
@@ -207,13 +208,17 @@ pub async fn player_page(
         return Ok(page(&app, "/games", "Player", &b, false).await);
     };
     let sites: Vec<String> = r.sites.iter().map(|n| esc(&app.cfg.label(n))).collect();
+    let key = match game::keys(&app.db(), &app.cfg.admins)?.remove(&call) {
+        Some(k) => format!("<code>{}</code>", esc(&k)),
+        None => "none yet".into(),
+    };
     let _ = write!(
         b,
         "<div class=cards><div class=card><div class=n>{}</div>points</div>\
          <div class=card><div class=n>{}</div>games</div><div class=card><div class=n>{}</div>sites</div>\
          <div class=card><div class=n>{}</div>foxes found</div></div>\
-         <p>Sites: {}</p><h2>Games</h2><div class=wrap><table><tr><th>Game</th><th>Day</th>\
-         <th>Team</th><th class=n>Points</th></tr>",
+         <p>Sites: {}</p><p class=small>Player key: {key}</p><h2>Games</h2><div class=wrap>\
+         <table><tr><th>Game</th><th>Day</th><th>Team</th><th class=n>Points</th></tr>",
         r.points,
         r.games.len(),
         r.sites.len(),
