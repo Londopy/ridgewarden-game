@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use ridgewarden_client::graph::Edge;
 use ridgewarden_client::ui::{Color, Page, pill};
 use ridgewarden_client::util::{esc, human_duration, now_ms, short_time};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
 
@@ -24,7 +24,7 @@ use crate::App;
 use crate::forms;
 use crate::game::{Rules, Session, Target, current};
 use crate::history;
-use crate::score::Played;
+use crate::score::{Played, chain_rate};
 use crate::world::Pos;
 
 pub fn router(app: Arc<App>) -> Router {
@@ -46,6 +46,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/player", get(history::player_page))
         .route("/stats", get(history::stats_page))
         .route("/api/game", get(game_json))
+        .route("/api/games", get(games_json))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(app)
 }
@@ -123,7 +124,7 @@ form.checkin button{font:inherit;padding:8px 16px;margin-top:6px}form.checkin [h
 /// itself every minute.
 const LIVE: &str = "<script>setInterval(function(){fetch(location.href).then(function(r){return r.ok?r.text():null}).then(function(t){if(!t)return;var m=new DOMParser().parseFromString(t,'text/html').querySelector('main');if(m)document.querySelector('main').replaceWith(m)}).catch(function(){})},15000)</script>";
 
-const PALETTE: [(&str, &str); 8] = [
+pub const PALETTE: [(&str, &str); 8] = [
     ("red", "#c0392b"),
     ("blue", "#2a7ab8"),
     ("green", "#2e8b3d"),
@@ -243,15 +244,18 @@ fn chains_html(app: &App, p: &Played, colors: &BTreeMap<String, &str>) -> String
     let mut b = String::from("<ul class=plain>");
     for c in &p.chains {
         let names: Vec<String> = c.sites.iter().map(|n| esc(&app.cfg.label(n))).collect();
-        let rate = p.session.rules.chain_points * c.sites.len() as i64
-            + p.session.rules.builder_points * c.new_links.len() as i64;
+        let (chain, builder) = chain_rate(&p.session.rules, c);
+        let rate = chain + builder;
         let _ = write!(
             b,
-            "<li>{}: {} <span class=\"mute small\">({} sites, {} links, {rate} points a minute{})</span></li>",
+            "<li>{}: {} <span class=\"mute small\">({} sites, {}, {rate} points a minute{})</span></li>",
             swatch(colors, &c.team),
             names.join(" &ndash; "),
             c.sites.len(),
-            c.links.len(),
+            match c.links.len() {
+                1 => "1 link".to_string(),
+                n => format!("{n} links"),
+            },
             match c.new_links.len() {
                 0 => String::new(),
                 1 => ", 1 new link".into(),
@@ -761,6 +765,29 @@ async fn game_json(State(app): State<Arc<App>>, Query(q): Query<Pick>) -> Result
     })
 }
 
+/// A game as `/api/games` lists it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Listed {
+    pub id: String,
+    pub name: String,
+    pub start: i64,
+    /// when it ended, or is planned to end
+    pub end: i64,
+    pub ended: bool,
+}
+
+/// Every game, newest first; an empty list before the first one.
+async fn games_json(State(app): State<Arc<App>>) -> Result<Json<Vec<Listed>>, Fail> {
+    let games = app.sessions()?.into_iter().map(|s| Listed {
+        id: s.id,
+        name: s.name,
+        start: s.start,
+        end: s.end,
+        ended: s.ended,
+    });
+    Ok(Json(games.collect()))
+}
+
 /// The rules in words, with the numbers a game uses.
 pub fn rules_html(r: &Rules) -> String {
     let types = r.link_types.join(", ");
@@ -893,6 +920,25 @@ mod tests {
             "20 for captures, 5 minutes of a 2-site chain"
         );
         assert!(board.contains("2/min"));
+    }
+
+    #[test]
+    fn a_chain_of_one_link_says_link() {
+        let mut g = G::new();
+        g.polls(T0 - 10 * MIN, T0 + 10 * MIN, "a", &["b"]);
+        let s = g.start(T0, json!({}));
+        g.checkin(T0 + MIN, &s, "N0AAA", "Red", "a");
+        g.checkin(T0 + MIN, &s, "N0BBB", "Red", "b");
+        let p = g.played(T0 + 5 * MIN);
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: Config = toml::from_str(EXAMPLE).unwrap();
+        cfg.data_dir = dir.path().into();
+        let app = App::new(cfg, false).unwrap();
+        let html = chains_html(&app, &p, &team_colors(&p.session.teams));
+        assert!(
+            html.contains("(2 sites, 1 link, 2 points a minute)"),
+            "{html}"
+        );
     }
 
     #[test]

@@ -17,6 +17,9 @@ target/
 *.db-wal
 *.db-shm
 
+# The terminal frame README_SHOTS=1 writes, only for taking docs/images/top.png
+docs/images/top.html
+
 # Secrets
 .env
 *.key

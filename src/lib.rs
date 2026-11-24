@@ -16,6 +16,7 @@ pub mod forms;
 pub mod game;
 pub mod history;
 pub mod score;
+pub mod tui;
 pub mod web;
 pub mod words;
 pub mod world;

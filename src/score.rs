@@ -100,6 +100,10 @@ pub struct Played {
     /// oldest first
     pub checkins: Vec<Judged>,
     pub holders: BTreeMap<String, String>,
+    /// for each held site, when it was taken or last had a link up; it goes back to nobody
+    /// once `hold_min` has passed since then
+    #[serde(default)]
+    pub linked: BTreeMap<String, i64>,
     pub chains: Vec<Chain>,
     pub up: BTreeSet<Edge>,
     pub known: BTreeSet<Edge>,
@@ -537,7 +541,8 @@ fn all_chains(
     out
 }
 
-fn chain_rate(r: &Rules, c: &Chain) -> (i64, i64) {
+/// What one chain earns a minute: (chain points, builder bonus).
+pub fn chain_rate(r: &Rules, c: &Chain) -> (i64, i64) {
     (
         r.chain_points * c.sites.len() as i64,
         r.builder_points * c.new_links.len() as i64,
@@ -838,6 +843,7 @@ pub fn play(
         players,
         checkins,
         holders: j.holder,
+        linked: j.linked,
         chains,
         up,
     })
@@ -1174,6 +1180,16 @@ mod tests {
         // a-b is up until +21; the last minute either had a link was +21
         let p = g.played(T0 + 50 * MIN);
         assert_eq!((p.holders.len(), p.lost.len()), (3, 0));
+        let linked: Vec<(&str, i64)> = p.linked.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        assert_eq!(
+            linked,
+            [
+                ("a", T0 + 21 * MIN),
+                ("b", T0 + 21 * MIN),
+                ("c", T0 + 33 * MIN)
+            ],
+            "the last minute each had a link up"
+        );
         let p = g.played(T0 + 51 * MIN);
         let lost: Vec<(i64, &str, &str)> = p
             .lost
@@ -1386,6 +1402,30 @@ mod tests {
         let before = g.played(T0 + 3 * 60 * MIN);
         g.f.conn.execute("DELETE FROM polls", []).unwrap();
         assert_eq!(g.played(T0 + 4 * 60 * MIN), before);
+    }
+
+    #[test]
+    fn a_result_frozen_before_holds_and_losses_were_kept_still_reads_back() {
+        let mut g = G::new();
+        g.polls(T0 - 10 * MIN, T0 + 30 * MIN, "a", &["b"]);
+        let s = g.start(T0, json!({"minutes": 20}));
+        g.checkin(T0 + MIN, &s, "N0AAA", "Red", "a");
+        g.checkin(T0 + MIN, &s, "N0BBB", "Red", "b");
+        let frozen = g.played(T0 + 3 * 60 * MIN);
+        assert!(!frozen.linked.is_empty());
+        // older versions froze results without these
+        let mut old = serde_json::to_value(&frozen).unwrap();
+        for field in ["linked", "lost"] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        g.f.conn
+            .execute("UPDATE results SET json = ?1", [old.to_string()])
+            .unwrap();
+        // with the polls gone, scoring it again would come out differently
+        g.f.conn.execute("DELETE FROM polls", []).unwrap();
+        let back = g.played(T0 + 4 * 60 * MIN);
+        assert_eq!(back.teams, frozen.teams, "read back, not scored again");
+        assert!(back.linked.is_empty() && back.lost.is_empty());
     }
 
     #[test]

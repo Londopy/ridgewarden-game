@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -11,9 +12,9 @@ use serde_json::{Value, json};
 use ridgewarden_game::config::{Config, EXAMPLE};
 use ridgewarden_game::game::{self, Session, Start, check_teams};
 use ridgewarden_game::web::{self, Peer};
-use ridgewarden_game::words;
 use ridgewarden_game::world::{Pos, World};
 use ridgewarden_game::{App, PROJECTIONS, spawn_loops};
+use ridgewarden_game::{tui, words};
 
 #[derive(Parser)]
 #[command(
@@ -38,6 +39,15 @@ enum Cmd {
     Init,
     /// Follow the core, take check-ins and serve the map and leaderboard
     Run,
+    /// Watch the game live in the terminal: scores, sites, plays, foxes and players
+    Top {
+        /// where the game's page answers
+        #[arg(long, default_value = tui::URL)]
+        url: String,
+        /// seconds between reads; the app works the scores out again at most every 10
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=600))]
+        every: u64,
+    },
     #[command(flatten)]
     Admin(Admin),
 }
@@ -111,13 +121,16 @@ enum SeasonCmd {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ridgewarden_game=info,ridgewarden_client=info".into()),
-        )
-        .init();
     let cli = Cli::parse();
+    // top draws the whole terminal, so a log line would land in the middle of it
+    if !matches!(cli.cmd, Cmd::Top { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "ridgewarden_game=info,ridgewarden_client=info".into()),
+            )
+            .init();
+    }
     match cli.cmd {
         Cmd::Init => {
             if cli.config.exists() {
@@ -137,6 +150,7 @@ fn main() -> Result<()> {
             let cfg = Config::load(&cli.config)?;
             tokio::runtime::Runtime::new()?.block_on(run(cfg))
         }
+        Cmd::Top { url, every } => tui::run(&url, Duration::from_secs(every)),
         Cmd::Admin(cmd) => {
             let app = App::new(Config::load(&cli.config)?, true)?;
             tokio::runtime::Runtime::new()?.block_on(admin(&app, cmd, &cli.config))
